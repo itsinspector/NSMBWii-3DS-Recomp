@@ -50,7 +50,9 @@ typedef struct {
     int efb_copy;
     uint16_t w, h;         /* GX size */
     C3D_Tex tex;           /* power-of-two GPU texture */
-    C3D_RenderTarget *rt;  /* for EFB copies */
+    C3D_RenderTarget *rt;  /* for EFB copies, and textures copies land in */
+    uint32_t addr, fmt;    /* guest address and GX format of a decoded texture */
+    uint16_t gw, gh;       /* its GX size (w, h can be half of it) */
     uint32_t last_use;
     int used;
     int next;              /* hash chain, -1 end */
@@ -238,6 +240,10 @@ static GpuTex *gpu_texture(int unit)
     g->key = t->key;
     g->w = t->width;
     g->h = t->height;
+    g->addr = addr;
+    g->fmt = BITS(img0, 20, 4);
+    g->gw = (uint16_t)w;
+    g->gh = (uint16_t)h;
     g->last_use = s_frame;
     ghash_insert(g);
     s_gtex_bytes += g->tex.width * g->tex.height * 4;
@@ -1024,7 +1030,9 @@ static void efb_tc(int ex, int ey, float *s, float *t)
     *t = (EFB_H - ey) * RT_SCALE / RT_SIZE;
 }
 
-static void copy_to_texture(int x0, int y0, int w, int h, int half)
+static void patch_textures(GpuTex *src, uint32_t dest, uint32_t copy_fmt);
+
+static void copy_to_texture(int x0, int y0, int w, int h, int half, uint32_t copy_fmt)
 {
     uint32_t dest = (g_gx.bp[BP_COPY_DEST] & 0xFFFFFF) << 5;
     int tw = half ? w / 2 : w, th = half ? h / 2 : h;
@@ -1062,6 +1070,65 @@ static void copy_to_texture(int x0, int y0, int w, int h, int half)
     C3D_TexBind(0, &s_efb_tex);
     draw_verts(q, 6);
     C3D_FrameDrawOn(s_efb_rt);
+    patch_textures(g, dest, copy_fmt);
+}
+
+/* block size of a GX texture format: width, height, bytes */
+static void tex_block(uint32_t fmt, int *bw, int *bh, int *bytes)
+{
+    *bw = 4, *bh = 4, *bytes = 32;
+    if (fmt == 6)
+        *bytes = 64;
+    else if (fmt == 1 || fmt == 2 || fmt == 9)
+        *bw = 8;
+    else if (fmt == 0 || fmt == 8 || fmt == 14)
+        *bw = 8, *bh = 8;
+}
+
+/* An EFB copy can land inside a bigger texture (tile animations are copied
+ * into the tileset with the tileset's stride). Copies are never written back
+ * to RAM here, so draw the copy into every decoded texture that holds the
+ * destination, at the texel position the address and stride give. Decoded
+ * textures can be half size and are stored bottom-up (see unit_flip). */
+static void patch_textures(GpuTex *src, uint32_t dest, uint32_t copy_fmt)
+{
+    int cbw, cbh, cbytes;
+    tex_block(copy_fmt == 7 || copy_fmt == 8 || copy_fmt == 9 || copy_fmt == 10 ? 1 :
+              copy_fmt == 11 || copy_fmt == 12 ? 3 : copy_fmt, &cbw, &cbh, &cbytes);
+    uint32_t row = (g_gx.bp[BP_COPY_STRIDE] & 0x3FF) * 32;
+    if (!row)
+        return;
+    for (int i = 0; i < GPU_TEX_SLOTS; i++) {
+        GpuTex *g = &s_gtex[i];
+        if (!g->used || g->efb_copy || !g->gw || g->addr > dest)
+            continue;
+        int bw, bh, bytes;
+        tex_block(g->fmt, &bw, &bh, &bytes);
+        uint32_t trow = (uint32_t)((g->gw + bw - 1) / bw) * bytes;
+        uint32_t off = dest - g->addr;
+        if (off >= trow * ((g->gh + bh - 1) / bh) || trow != row || bw != cbw || bh != cbh || bytes != cbytes)
+            continue;
+        int x = (int)(off % row / bytes) * bw, y = (int)(off / row) * bh;
+        if (x >= g->gw || y >= g->gh)
+            continue;
+        if (!g->rt && !(g->rt = C3D_RenderTargetCreateFromTex(&g->tex, GPU_TEXFACE_2D, 0, -1)))
+            continue;
+        CVert *q = alloc_verts(6);
+        if (!q)
+            return;
+        float sx = (float)g->w / g->gw / g->tex.width, sy = (float)g->h / g->gh / g->tex.height;
+        float x0 = 2.0f * x * sx - 1.0f, x1 = 2.0f * (x + src->w) * sx - 1.0f;
+        float ytop = 1.0f - 2.0f * y * sy, ybot = 1.0f - 2.0f * (y + src->h) * sy;
+        static const float white[4] = {1, 1, 1, 1};
+        quad(q, x0, ybot, x1, ytop, -0.5f, 0, (float)src->h / src->tex.height, (float)src->w / src->tex.width, 0, white);
+        C3D_FrameDrawOn(g->rt);
+        simple_env(1);
+        C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_COLOR);
+        C3D_TexSetFilter(&src->tex, g->w < g->gw ? GPU_LINEAR : GPU_NEAREST, GPU_NEAREST);
+        C3D_TexBind(0, &src->tex);
+        draw_verts(q, 6);
+    }
+    C3D_FrameDrawOn(s_efb_rt);
 }
 
 static void clear_rect(int x0, int y0, int w, int h)
@@ -1094,7 +1161,7 @@ void gfx_efb_copy(uint32_t trigger)
     if (BITS(trigger, 14, 1))
         gfx_present();
     else
-        copy_to_texture(x0, y0, w, h, (int)BITS(trigger, 9, 1));
+        copy_to_texture(x0, y0, w, h, (int)BITS(trigger, 9, 1), BITS(trigger, 3, 4) / 2 + (BITS(trigger, 3, 4) & 1) * 8);
     if (BITS(trigger, 11, 1)) {
         begin_frame();
         clear_rect(x0, y0, w, h);
