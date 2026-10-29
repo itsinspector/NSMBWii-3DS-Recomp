@@ -128,13 +128,27 @@ static uint32_t data_size(uint32_t fmt, int w, int h)
     return (uint32_t)(((w + bw - 1) / bw) * ((h + bh - 1) / bh) * bytes);
 }
 
+/* Hashes every byte: games animate tiles by rewriting a few blocks of a big
+ * tileset texture (? blocks, coins), which a sampled hash misses. Four
+ * independent lanes over 32-byte steps keep a full pass cheap. */
 static uint32_t hash(const uint8_t *p, uint32_t n)
 {
-    uint32_t h = 2166136261u;
-    uint32_t step = n > 4096 ? n / 1024 : 1;      /* sample large textures */
-    for (uint32_t i = 0; i < n; i += step)
-        h = (h ^ p[i]) * 16777619u;
-    return h;
+    const uint64_t k = 0x9E3779B97F4A7C15ull;
+    uint64_t h0 = n, h1 = k, h2 = ~k, h3 = n * k;
+    uint32_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        uint64_t w[4];
+        memcpy(w, p + i, 32);
+        h0 = (h0 ^ w[0]) * k; h0 ^= h0 >> 31;
+        h1 = (h1 ^ w[1]) * k; h1 ^= h1 >> 31;
+        h2 = (h2 ^ w[2]) * k; h2 ^= h2 >> 31;
+        h3 = (h3 ^ w[3]) * k; h3 ^= h3 >> 31;
+    }
+    for (; i < n; i++)
+        h0 = (h0 ^ p[i]) * k;
+    uint64_t h = h0 ^ (h1 * 3) ^ (h2 * 5) ^ (h3 * 7);
+    h ^= h >> 33;
+    return (uint32_t)(h ^ (h >> 32));
 }
 
 /* Set-associative cache (SETS x WAYS) keyed by identity (address, format,

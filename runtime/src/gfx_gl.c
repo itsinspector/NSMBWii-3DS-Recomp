@@ -132,6 +132,7 @@ typedef struct {
     int type;
     uint32_t index;            /* draw index */
     uint32_t trigger, dest;    /* copies */
+    uint32_t stride;           /* copy destination stride in 32-byte lines */
     int rect[4];
     uint32_t clear_ar, clear_gb, clear_z, cmode0, zmode;
     uint32_t pe_ctrl;          /* pixel format: RGB8/RGB565 EFBs read alpha as 1 */
@@ -315,6 +316,7 @@ void gl_efb_copy(uint32_t trigger)
     c->type = BITS(trigger, 14, 1) ? CMD_PRESENT : CMD_COPY;
     c->trigger = trigger;
     c->dest = (g_gx.bp[BP_COPY_DEST] & 0xFFFFFF) << 5;
+    c->stride = g_gx.bp[BP_COPY_STRIDE] & 0x3FF;
     c->rect[0] = (int)BITS(tl, 0, 10);
     c->rect[1] = (int)BITS(tl, 10, 10);
     c->rect[2] = (int)BITS(sz, 0, 10) + 1;
@@ -354,8 +356,8 @@ void gl_present(void)
 
 static HDC s_dc;
 static GLuint s_ibo;
-static GLuint s_vao, s_vbo, s_efb_fbo, s_efb_tex, s_efb_depth, s_tmp_fbo;
-static uint32_t s_frames, s_dump_every;
+static GLuint s_vao, s_vbo, s_efb_fbo, s_efb_tex, s_efb_depth, s_tmp_fbo, s_patch_fbo;
+static uint32_t s_frames, s_dump_every, s_dump_from;
 
 typedef struct {
     uint32_t hash;
@@ -376,6 +378,7 @@ typedef struct {
     uint32_t last;
     int efb_copy;
     uint32_t addr;
+    uint32_t fmt;              /* GX texture format of a decoded texture */
     uint32_t mode;             /* wrap/filter last set on this texture (bit 31: valid) */
 } GTex;
 
@@ -768,6 +771,8 @@ static GTex *texture_for(const TexRef *r)
             glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, r->w, r->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, r->rgba);
             t->key = r->key;
+            t->addr = r->addr;
+            t->fmt = r->fmt;
             t->w = r->w;
             t->h = r->h;
         }
@@ -984,7 +989,7 @@ static const char *k_copy_fs =
     "    float l = u_intensity != 0 ? dot(c.rgb, vec3(0.299, 0.587, 0.114)) : c.r;\n"
     "    if (u_fmt <= 1 || u_fmt == 8) o = vec4(l);\n"
     "    else if (u_fmt == 2 || u_fmt == 3) o = vec4(l, l, l, c.a);\n"
-    "    else if (u_fmt == 4 || u_fmt == 5) o = vec4(c.rgb, 1.0);\n"
+    "    else if (u_fmt == 4) o = vec4(c.rgb, 1.0);\n"
     "    else if (u_fmt == 7) o = vec4(c.a);\n"
     "    else if (u_fmt == 9) o = vec4(c.g);\n"
     "    else if (u_fmt == 10) o = vec4(c.b);\n"
@@ -992,6 +997,51 @@ static const char *k_copy_fs =
     "    else if (u_fmt == 12) o = vec4(c.b, c.b, c.b, c.g);\n"
     "    else o = c;\n"
     "}\n";
+
+/* block size of a GX texture format: width, height, bytes */
+static void tex_block(uint32_t fmt, int *bw, int *bh, int *bytes)
+{
+    *bw = 4, *bh = 4, *bytes = 32;
+    if (fmt == 6)
+        *bytes = 64;
+    else if (fmt == 1 || fmt == 2 || fmt == 9)
+        *bw = 8;
+    else if (fmt == 0 || fmt == 8 || fmt == 14)
+        *bw = 8, *bh = 8;
+}
+
+/* An EFB copy can land inside a bigger texture (tile animations are copied
+ * into the tileset with the tileset's stride). Copies are never written back
+ * to RAM here, so put the copied pixels into every decoded texture that holds
+ * the destination, at the texel position the address and stride give. */
+static void patch_textures(const Cmd *c, const GTex *src, uint32_t copy_fmt)
+{
+    int cbw, cbh, cbytes;
+    tex_block(copy_fmt == 7 || copy_fmt == 8 || copy_fmt == 9 || copy_fmt == 10 ? 1 :
+              copy_fmt == 11 || copy_fmt == 12 ? 3 : copy_fmt, &cbw, &cbh, &cbytes);
+    uint32_t row = c->stride * 32;
+    if (!row)
+        return;
+    for (int i = 0; i < TEX_CACHE; i++) {
+        GTex *t = &s_tex[i];
+        if (!t->tex || t->efb_copy || t->addr > c->dest)
+            continue;
+        int bw, bh, bytes;
+        tex_block(t->fmt, &bw, &bh, &bytes);
+        uint32_t trow = (uint32_t)((t->w + bw - 1) / bw) * bytes;
+        uint32_t off = c->dest - t->addr;
+        if (off >= trow * ((t->h + bh - 1) / bh) || trow != row || bw != cbw || bh != cbh || bytes != cbytes)
+            continue;
+        int x = (int)(off % row / bytes) * bw, y = (int)(off / row) * bh;
+        int w = src->w < t->w - x ? src->w : t->w - x, h = src->h < t->h - y ? src->h : t->h - y;
+        if (w <= 0 || h <= 0)
+            continue;
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, s_tmp_fbo);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, s_patch_fbo);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t->tex, 0);
+        glBlitFramebuffer(0, 0, w, h, x, y, x + w, y + h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    }
+}
 
 static void exec_copy(const Cmd *c)
 {
@@ -1040,6 +1090,7 @@ static void exec_copy(const Cmd *c)
         glUniform1i(s_copy_u_noalpha, pf == 0 || pf == 2);
         glBindVertexArray(s_copy_vao);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        patch_textures(c, t, (tpf >> 1) + (tpf & 1) * 8);
         glBindVertexArray(s_vao);
         glViewport(0, 0, EFB_W * s_scale, EFB_H * s_scale);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, s_efb_fbo);
@@ -1079,7 +1130,7 @@ static void exec_present(const Cmd *c)
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glBlitFramebuffer(0, (EFB_H - h) * s_scale, w * s_scale, EFB_H * s_scale, 0, 0, rc.right, rc.bottom,
                       GL_COLOR_BUFFER_BIT, GL_LINEAR);
-    if (s_dump_every && s_frames % s_dump_every == 0) {
+    if (s_dump_every && s_frames >= s_dump_from && s_frames % s_dump_every == 0) {
         int pw = w * s_scale, ph = h * s_scale;
         uint8_t *img = malloc((size_t)pw * ph * 4), *flip = malloc((size_t)pw * ph * 4);
         glPixelStorei(GL_PACK_ALIGNMENT, 4);
@@ -1247,6 +1298,7 @@ static int gl_setup(void)
     glClearDepth(1.0);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glGenFramebuffers(1, &s_tmp_fbo);
+    glGenFramebuffers(1, &s_patch_fbo);
     s_copy_prog = glCreateProgram();
     glAttachShader(s_copy_prog, compile(GL_VERTEX_SHADER, k_copy_vs));
     glAttachShader(s_copy_prog, compile(GL_FRAGMENT_SHADER, k_copy_fs));
@@ -1286,6 +1338,8 @@ int gl_init(void)
 {
     const char *e = getenv("NSMBW_DUMP_FRAMES");
     s_dump_every = e ? (uint32_t)atoi(e) : 0;
+    const char *from = getenv("NSMBW_DUMP_FROM");   /* first frame to dump */
+    s_dump_from = from ? (uint32_t)atoi(from) : 0;
     const char *sc = getenv("NSMBW_RES_SCALE");
     if (sc && atoi(sc) >= 1 && atoi(sc) <= 4)
         s_scale = atoi(sc);

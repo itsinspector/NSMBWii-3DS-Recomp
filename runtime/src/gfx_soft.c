@@ -697,8 +697,11 @@ static void write_copy_texture(uint32_t trigger, int x0, int y0, int w, int h)
     if (fmt == 6) bytes = 64;
     else if (fmt == 1 || fmt == 7 || fmt == 8 || fmt == 9 || fmt == 10) { bw = 8; bh = 4; }
     else if (fmt == 0) { bw = 8; bh = 8; }
-    uint32_t out = dest | 0x80000000u;
+    /* rows of blocks are the destination stride apart: tile animations copy
+     * into the middle of a bigger texture */
+    uint32_t stride = (g_gx.bp[BP_COPY_STRIDE] & 0x3FF) * 32;
     for (int by = 0; by < h; by += bh) {
+        uint32_t out = (dest + (stride ? (uint32_t)(by / bh) * stride : (uint32_t)(by / bh * ((w + bw - 1) / bw) * bytes))) | 0x80000000u;
         for (int bx = 0; bx < w; bx += bw) {
             uint8_t blk[64] = {0};
             for (int yy = 0; yy < bh; yy++) {
@@ -719,7 +722,8 @@ static void write_copy_texture(uint32_t trigger, int x0, int y0, int w, int h)
                     case 3: blk[2 * i] = (uint8_t)a; blk[2 * i + 1] = (uint8_t)(intensity ? lum : r); break;
                     case 4: { uint16_t v = (uint16_t)((r >> 3) << 11 | (g >> 2) << 5 | (b >> 3));
                               blk[2 * i] = (uint8_t)(v >> 8); blk[2 * i + 1] = (uint8_t)v; break; }
-                    case 5: { uint16_t v = (uint16_t)(0x8000 | (r >> 3) << 10 | (g >> 3) << 5 | (b >> 3));
+                    case 5: { uint16_t v = a >= 0xE0 ? (uint16_t)(0x8000 | (r >> 3) << 10 | (g >> 3) << 5 | (b >> 3))
+                                                     : (uint16_t)((a >> 5) << 12 | (r >> 4) << 8 | (g >> 4) << 4 | (b >> 4));
                               blk[2 * i] = (uint8_t)(v >> 8); blk[2 * i + 1] = (uint8_t)v; break; }
                     default: blk[2 * i] = (uint8_t)a; blk[2 * i + 1] = (uint8_t)r;
                              blk[32 + 2 * i] = (uint8_t)g; blk[32 + 2 * i + 1] = (uint8_t)b; break;
