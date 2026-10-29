@@ -114,11 +114,13 @@ void hle_KPADRead(PPCContext *c)
     st32(out + KS_RELEASE, s_prev_hold & ~hold);
     s_prev_hold = hold;
 
-    /* remote at rest, face up; a shake swings the X axis hard */
+    /* remote at rest, face up. dGameKeyCore_c counts a shake when the Y axis
+     * changes by more than a threshold on 4 reads in a row (and Z does not
+     * dominate), so a shake flips Y hard on every read. */
     float ax = 0.0f, ay = 0.0f, az = 1.0f, speed = 0.0f;
     s_frame++;
     if (in & PAD_SHAKE) {
-        ax = (s_frame & 2) ? 2.5f : -2.5f;
+        ay = (s_frame & 1) ? 2.5f : -2.5f;
         speed = 2.5f;
     }
     stf(out + KS_ACC, ax);
