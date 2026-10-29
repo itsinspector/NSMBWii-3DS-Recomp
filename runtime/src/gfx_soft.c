@@ -690,6 +690,8 @@ static void write_copy_texture(uint32_t trigger, int x0, int y0, int w, int h)
     uint32_t tpf = BITS(trigger, 3, 4);
     uint32_t fmt = tpf / 2 + (tpf & 1) * 8;           /* EFB copy texture format */
     int intensity = BITS(trigger, 15, 1);
+    uint32_t pf = BITS(g_gx.bp[0x43], 0, 3);
+    int noalpha = pf == 0 || pf == 2;           /* RGB8_Z24 / RGB565_Z16: alpha reads as 1 */
     if (half) { w /= 2; h /= 2; }
     int bw = 4, bh = 4, bytes = 32;
     if (fmt == 6) bytes = 64;
@@ -706,7 +708,7 @@ static void write_copy_texture(uint32_t trigger, int x0, int y0, int w, int h)
                     if (sy >= EFB_H) sy = EFB_H - 1;
                     const uint8_t *p = s_efb[sy][sx];
                     int i = yy * bw + xx;
-                    uint32_t r = p[0], g = p[1], b = p[2], a = p[3];
+                    uint32_t r = p[0], g = p[1], b = p[2], a = noalpha ? 255 : p[3];
                     uint32_t lum = (r * 77 + g * 150 + b * 29) >> 8;
                     switch (fmt) {
                     case 0: { uint32_t v = (intensity ? lum : r) >> 4; blk[i / 2] |= (uint8_t)(v << ((i & 1) ? 0 : 4)); break; }

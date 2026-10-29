@@ -80,6 +80,8 @@ typedef ptrdiff_t GLintptr;
     X(void, glUniform2f, (GLint, GLfloat, GLfloat)) \
     X(void, glUniform4f, (GLint, GLfloat, GLfloat, GLfloat, GLfloat)) \
     X(void, glUniform4fv, (GLint, GLsizei, const GLfloat *)) \
+    X(void, glUniform2fv, (GLint, GLsizei, const GLfloat *)) \
+    X(void, glUniform4iv, (GLint, GLsizei, const GLint *)) \
     X(void, glGenFramebuffers, (GLsizei, GLuint *)) \
     X(void, glBindFramebuffer, (GLenum, GLuint)) \
     X(void, glFramebufferTexture2D, (GLenum, GLenum, GLenum, GLuint, GLint)) \
@@ -119,6 +121,8 @@ typedef struct {
     TexRef tex[8];
     int sc[4];
     float vp[6], off[2];
+    /* indirect texturing: per-stage commands, stage refs and scales, matrices */
+    uint32_t ind_cmd[16], iref, ind_ss[2], ind_mtx[9];
     uint32_t first, count;     /* indices in the batch */
 } Draw;
 
@@ -130,6 +134,7 @@ typedef struct {
     uint32_t trigger, dest;    /* copies */
     int rect[4];
     uint32_t clear_ar, clear_gb, clear_z, cmode0, zmode;
+    uint32_t pe_ctrl;          /* pixel format: RGB8/RGB565 EFBs read alpha as 1 */
 } Cmd;
 
 typedef struct {
@@ -150,6 +155,7 @@ static plat_sem *s_go, *s_done;
 static volatile int s_busy;        /* render thread owns the other batch */
 static int s_scale = 2;
 static int s_ok;
+void png_write_rgba(const char *path, const uint8_t *rgba, int w, int h);
 static int s_gl_debug = -1;     /* NSMBW_GL_DEBUG bits: 1 no depth, 2 no EFB copy textures, 4 no blend, 8 no alpha test */
 
 /* --------------------------------------------------------- recording side */
@@ -225,10 +231,26 @@ void gl_draw_indexed(const GXVertex *v, uint32_t nverts, const uint32_t *idx, ui
     memcpy(d->reg, g_gx.tev_reg, sizeof d->reg);
     memcpy(d->konst, g_gx.tev_konst, sizeof d->konst);
     memset(d->tex, 0, sizeof d->tex);
-    for (int s = 0; s < nstages; s++) {
-        uint32_t tref = g_gx.bp[BP_TREF(s)] >> ((s & 1) * 12);
-        uint32_t map = BITS(tref, 0, 3);
-        if (!BITS(tref, 6, 1) || d->tex[map].mode0 & 0x80000000u)
+    int nind = (int)BITS(d->bp_gen, 16, 3);
+    for (int s = 0; s < nstages; s++)
+        d->ind_cmd[s] = g_gx.bp[0x10 + s];
+    d->iref = g_gx.bp[0x27];
+    d->ind_ss[0] = g_gx.bp[0x25];
+    d->ind_ss[1] = g_gx.bp[0x26];
+    for (int i = 0; i < 9; i++)
+        d->ind_mtx[i] = g_gx.bp[0x06 + i];
+    /* texture maps used by TEV stages, then by indirect stages */
+    for (int s = 0; s < nstages + nind; s++) {
+        uint32_t map;
+        if (s < nstages) {
+            uint32_t tref = g_gx.bp[BP_TREF(s)] >> ((s & 1) * 12);
+            map = BITS(tref, 0, 3);
+            if (!BITS(tref, 6, 1))
+                continue;
+        } else {
+            map = BITS(d->iref, (s - nstages) * 6, 3);
+        }
+        if (d->tex[map].mode0 & 0x80000000u)
             continue;
         TexRef *t = &d->tex[map];
         t->mode0 = g_gx.bp[BP_TX_MODE0(map)] | 0x80000000u;   /* bit 31: slot used */
@@ -256,18 +278,6 @@ void gl_draw_indexed(const GXVertex *v, uint32_t nverts, const uint32_t *idx, ui
     d->off[0] = (float)ox;
     d->off[1] = (float)oy;
 
-    static int logdraws = -1;
-    if (logdraws < 0)
-        logdraws = getenv("NSMBW_GL_LOGDRAWS") != NULL;
-    if (logdraws) {
-        static int n;
-        extern uint32_t hw_frame_count(void);
-        if (hw_frame_count() > 3200 && d->sc[3] > 456 && n++ < 60)
-            rt_log("[draw] %u verts vp %.1f %.1f %.1f %.1f %.1f %.1f sc %d %d %d %d off %.0f %.0f v0 %.3f %.3f %.3f %.3f c %.2f %.2f %.2f %.2f",
-                   count, d->vp[0], d->vp[1], d->vp[2], d->vp[3], d->vp[4], d->vp[5], d->sc[0], d->sc[1], d->sc[2], d->sc[3],
-                   d->off[0], d->off[1], v[0].pos[0], v[0].pos[1], v[0].pos[2], v[0].pos[3],
-                   v[0].color[0][0], v[0].color[0][1], v[0].color[0][2], v[0].color[0][3]);
-    }
     Batch *b = &s_batch[s_fill];
     b->verts = grow(b->verts, &b->verts_cap, b->nverts + nverts, sizeof(GXVertex));
     b->idx = grow(b->idx, &b->idx_cap, b->nidx + count, sizeof(uint32_t));
@@ -314,6 +324,7 @@ void gl_efb_copy(uint32_t trigger)
     c->clear_z = g_gx.bp[BP_CLEAR_Z];
     c->cmode0 = g_gx.bp[BP_CMODE0];
     c->zmode = g_gx.bp[BP_ZMODE];
+    c->pe_ctrl = g_gx.bp[0x43];
     if (c->type == CMD_PRESENT)
         gl_present();
 }
@@ -348,12 +359,12 @@ static uint32_t s_frames, s_dump_every;
 
 typedef struct {
     uint32_t hash;
-    uint32_t key[64];
+    uint32_t key[96];
     int nkey;
     GLuint prog;
-    GLint u_vp, u_z, u_reg, u_k, u_aref, u_s;
+    GLint u_vp, u_z, u_reg, u_k, u_aref, u_s, u_tsize, u_indmtx;
     int u_valid;
-    float u_last[4 + 2 + 16 + 16 + 2];  /* uniform values last uploaded */
+    float u_last[4 + 2 + 16 + 16 + 2 + 16 + 24];  /* uniform values last uploaded */
 } Prog;
 #define PROG_CACHE 1024
 static Prog s_progs[PROG_CACHE];
@@ -489,10 +500,22 @@ static char *gen_fs(const Draw *d)
     int nstages = (int)BITS(d->bp_gen, 10, 4) + 1;
     P("#version 330 core\nin vec4 v_c0; in vec4 v_c1; in vec3 v_t[8];\n"
       "uniform sampler2D u_s[8]; uniform vec4 u_reg[4]; uniform vec4 u_k[4]; uniform vec2 u_aref;\n"
+      "uniform vec2 u_tsize[8]; uniform ivec4 u_indmtx[6];\n"
       "out vec4 o;\n"
       "float q8(float x){ return floor(clamp(x,0.0,1.0)*255.0+0.5); }\n"
       "void main(){\n vec4 r0=u_reg[0], r1=u_reg[1], r2=u_reg[2], r3=u_reg[3]; vec4 tx=vec4(1.0), rs=vec4(0.0);\n"
-      " vec3 a,b,c,dd; float aa,ab,ac,ad; vec3 res; float resa;\n");
+      " vec3 a,b,c,dd; float aa,ab,ac,ad; vec3 res; float resa; ivec2 tevcoord = ivec2(0), wc, it; ivec3 ic;\n");
+    /* indirect stages: sample the offset textures (Dolphin's fixed point: texel units * 128) */
+    int nind = (int)BITS(d->bp_gen, 16, 3), ngen = (int)BITS(d->bp_gen, 0, 4);
+    for (int i = 0; i < nind && i < 4; i++) {
+        uint32_t imap = BITS(d->iref, i * 6, 3), icoord = BITS(d->iref, i * 6 + 3, 3);
+        uint32_t ss = d->ind_ss[i / 2] >> ((i & 1) * 8);
+        if ((int)icoord < ngen && d->tex[imap].mode0)
+            P(" ivec3 ind%d = ivec3(texture(u_s[%u], vec2(ivec2(v_t[%u].xy / (v_t[%u].z == 0.0 ? 1.0 : v_t[%u].z) * u_tsize[%u] * 128.0) >> ivec2(%u, %u)) / (u_tsize[%u] * 128.0)).abg * 255.0 + 0.5);\n",
+              i, imap, icoord, icoord, icoord, imap, BITS(ss, 0, 4), BITS(ss, 4, 4), imap);
+        else
+            P(" ivec3 ind%d = ivec3(0);\n", i);
+    }
     static const char *regs[4] = {"r0", "r1", "r2", "r3"};
     static const char *bias[4] = {"0.0", "0.5", "-0.5", "0.0"};
     static const char *scale[4] = {"1.0", "2.0", "4.0", "0.5"};
@@ -502,9 +525,43 @@ static char *gen_fs(const Draw *d)
         uint32_t cenv = d->cenv[st], aenv = d->aenv[st];
         uint32_t ksel = d->ksel[st / 2] >> ((st & 1) * 10);
         char sw[5], kc[48], ka[48], in[4][48], ain[4][48];
+        uint32_t ic = d->ind_cmd[st];
+        uint32_t ibt = BITS(ic, 0, 2), ifmt = BITS(ic, 2, 2), ibias = BITS(ic, 4, 3), imid = BITS(ic, 9, 4);
+        uint32_t isw = BITS(ic, 13, 3), itw = BITS(ic, 16, 3), iadd = BITS(ic, 20, 1);
+        int ind_active = nind && (imid || isw || itw || iadd);
+        if (ind_active) {
+            static const char *mask[4] = {"255", "31", "15", "7"};
+            static const char *wrap[8] = {"", "(256<<7)", "(128<<7)", "(64<<7)", "(32<<7)", "(16<<7)", "0", "0"};
+            P(" ic = ind%u & %s;\n", ibt, mask[ifmt]);
+            const char *b = ifmt == 0 ? "-128" : "1";
+            if (ibias & 1) P(" ic.x += %s;\n", b);
+            if (ibias & 2) P(" ic.y += %s;\n", b);
+            if (ibias & 4) P(" ic.z += %s;\n", b);
+            if (imid >= 1 && imid <= 3) {
+                int m = (int)(imid - 1) * 2;
+                P(" it = ivec2(u_indmtx[%d].x*ic.x + u_indmtx[%d].y*ic.y + u_indmtx[%d].z*ic.z,"
+                  " u_indmtx[%d].x*ic.x + u_indmtx[%d].y*ic.y + u_indmtx[%d].z*ic.z) >> 3;\n", m, m, m, m + 1, m + 1, m + 1);
+                P(" it = u_indmtx[%d].w >= 0 ? it >> u_indmtx[%d].w : it << (-u_indmtx[%d].w);\n", m, m, m);
+            } else {
+                P(" it = ivec2(0);\n");
+            }
+            if ((int)coord < ngen)
+                P(" wc = ivec2(v_t[%u].xy / (v_t[%u].z == 0.0 ? 1.0 : v_t[%u].z) * u_tsize[%u] * 128.0);\n",
+                  coord, coord, coord, map);
+            else
+                P(" wc = ivec2(0);\n");
+            if (isw >= 6) P(" wc.x = 0;\n");
+            else if (isw) P(" wc.x = wc.x & (%s - 1);\n", wrap[isw]);
+            if (itw >= 6) P(" wc.y = 0;\n");
+            else if (itw) P(" wc.y = wc.y & (%s - 1);\n", wrap[itw]);
+            P(" tevcoord = %swc + it;\n", iadd ? "tevcoord + " : "");
+        }
         if (en && d->tex[map].mode0) {
             swap_str(d, (int)BITS(aenv, 2, 2), sw);
-            P(" tx = texture(u_s[%u], v_t[%u].xy / (v_t[%u].z == 0.0 ? 1.0 : v_t[%u].z)).%s;\n", map, coord, coord, coord, sw);
+            if (ind_active)
+                P(" tx = texture(u_s[%u], vec2(tevcoord) / (u_tsize[%u] * 128.0)).%s;\n", map, map, sw);
+            else
+                P(" tx = texture(u_s[%u], v_t[%u].xy / (v_t[%u].z == 0.0 ? 1.0 : v_t[%u].z)).%s;\n", map, coord, coord, coord, sw);
         } else {
             P(" tx = vec4(1.0);\n");
         }
@@ -584,12 +641,21 @@ static int shader_key(const Draw *d, uint32_t *k)
         if (d->tex[i].mode0)
             used |= 1u << i;
     k[n++] = used;
+    int nind = (int)BITS(d->bp_gen, 16, 3);
+    k[n++] = (uint32_t)nind;
+    if (nind) {
+        k[n++] = d->iref;
+        k[n++] = d->ind_ss[0];
+        k[n++] = d->ind_ss[1];
+    }
+    for (int s = 0; s < nstages; s++)
+        k[n++] = d->ind_cmd[s] & 0x1FFFFF;
     return n;
 }
 
 static Prog *get_prog(const Draw *d)
 {
-    uint32_t key[64];
+    uint32_t key[96];
     int n = shader_key(d, key);
     uint32_t h = 2166136261u;
     for (int i = 0; i < n; i++)
@@ -623,6 +689,8 @@ static Prog *get_prog(const Draw *d)
             p->u_k = glGetUniformLocation(prog, "u_k");
             p->u_aref = glGetUniformLocation(prog, "u_aref");
             p->u_s = glGetUniformLocation(prog, "u_s");
+            p->u_tsize = glGetUniformLocation(prog, "u_tsize");
+            p->u_indmtx = glGetUniformLocation(prog, "u_indmtx");
             glUseProgram(prog);
             s_gs.prog = prog;
             GLint units[8] = {0, 1, 2, 3, 4, 5, 6, 7};
@@ -760,12 +828,26 @@ static void exec_draw(const Draw *d)
         glUseProgram(p->prog);
         s_gs.prog = p->prog;
     }
-    float u[40];
+    float u[80];
     u[0] = d->vp[0]; u[1] = d->vp[1]; u[2] = d->vp[3] - d->off[0]; u[3] = d->vp[4] - d->off[1];
     u[4] = d->vp[2] / 16777216.0f; u[5] = d->vp[5] / 16777216.0f;
     memcpy(u + 6, &d->reg[0][0], 16 * sizeof(float));
     memcpy(u + 22, &d->konst[0][0], 16 * sizeof(float));
     u[38] = (float)BITS(d->alpha, 0, 8); u[39] = (float)BITS(d->alpha, 8, 8);
+    for (int i = 0; i < 8; i++) {
+        u[40 + i * 2] = d->tex[i].w ? (float)d->tex[i].w : 1.0f;
+        u[41 + i * 2] = d->tex[i].h ? (float)d->tex[i].h : 1.0f;
+    }
+    /* indirect matrices as Dolphin keeps them: rows (ma mc me shift), (mb md mf shift) */
+    for (int m = 0; m < 3; m++) {
+        uint32_t a = d->ind_mtx[m * 3], b = d->ind_mtx[m * 3 + 1], c = d->ind_mtx[m * 3 + 2];
+        int scale = (int)(BITS(a, 22, 2) | BITS(b, 22, 2) << 2 | BITS(c, 22, 2) << 4);
+        float *r0 = &u[56 + m * 8], *r1 = r0 + 4;
+        r0[0] = (float)((int32_t)(a << 21) >> 21); r0[1] = (float)((int32_t)(b << 21) >> 21);
+        r0[2] = (float)((int32_t)(c << 21) >> 21); r0[3] = (float)(17 - scale);
+        r1[0] = (float)((int32_t)((a >> 11) << 21) >> 21); r1[1] = (float)((int32_t)((b >> 11) << 21) >> 21);
+        r1[2] = (float)((int32_t)((c >> 11) << 21) >> 21); r1[3] = (float)(17 - scale);
+    }
     if (!p->u_valid || memcmp(u, p->u_last, sizeof u)) {
         if (!p->u_valid || memcmp(u, p->u_last, 6 * sizeof(float))) {
             glUniform4f(p->u_vp, u[0], u[1], u[2], u[3]);
@@ -774,6 +856,11 @@ static void exec_draw(const Draw *d)
         glUniform4fv(p->u_reg, 4, u + 6);
         glUniform4fv(p->u_k, 4, u + 22);
         glUniform2f(p->u_aref, u[38], u[39]);
+        glUniform2fv(p->u_tsize, 8, u + 40);
+        GLint im[24];
+        for (int i = 0; i < 24; i++)
+            im[i] = (GLint)u[56 + i];
+        glUniform4iv(p->u_indmtx, 6, im);
         memcpy(p->u_last, u, sizeof u);
         p->u_valid = 1;
     }
@@ -866,30 +953,12 @@ static void exec_draw(const Draw *d)
         memcpy(s_gs.scissor, sc, sizeof sc);
     }
     s_gs.valid = 1;
-    if ((s_gl_debug & 64) && d->sc[1] >= 456) {
-        static int n;
-        if (n++ < 3) {
-            char *fs = gen_fs(d);
-            rt_log("[gl] offscreen draw: %u verts, zmode %08lX cmode0 %08lX cmode1 %08lX gen %08lX %s", d->count,
-                   (unsigned long)d->zmode, (unsigned long)d->cmode0, (unsigned long)d->cmode1, (unsigned long)d->bp_gen, fs);
-            free(fs);
-            for (int i = 0; i < 8; i++)
-                if (d->tex[i].mode0) {
-                    GTex *t = texture_for(&d->tex[i]);
-                    rt_log("[gl]   tex%d addr %08lX %ux%u fmt %lu key %08lX rgba %p -> %s", i, (unsigned long)d->tex[i].addr,
-                           d->tex[i].w, d->tex[i].h, (unsigned long)d->tex[i].fmt, (unsigned long)d->tex[i].key,
-                           (const void *)d->tex[i].rgba, t ? (t->efb_copy ? "EFB copy" : "decoded") : "MISSING");
-                }
-        }
-    }
     glDrawElements(GL_TRIANGLES, (GLsizei)d->count, GL_UNSIGNED_INT, (const void *)((uintptr_t)d->first * 4));
 }
 
-void png_write_rgba(const char *path, const uint8_t *rgba, int w, int h);
 
-void png_write_rgba(const char *path, const uint8_t *rgba, int w, int h);
 static GLuint s_copy_prog, s_copy_vao;
-static GLint s_copy_u_src, s_copy_u_fmt, s_copy_u_intensity;
+static GLint s_copy_u_src, s_copy_u_fmt, s_copy_u_intensity, s_copy_u_noalpha;
 
 static const char *k_copy_vs =
     "#version 330 core\n"
@@ -906,11 +975,12 @@ static const char *k_copy_vs =
 static const char *k_copy_fs =
     "#version 330 core\n"
     "uniform sampler2D u_efb;\n"
-    "uniform int u_fmt, u_intensity;\n"
+    "uniform int u_fmt, u_intensity, u_noalpha;\n"
     "in vec2 v_uv;\n"
     "out vec4 o;\n"
     "void main() {\n"
     "    vec4 c = texture(u_efb, v_uv);\n"
+    "    if (u_noalpha != 0) c.a = 1.0;\n"
     "    float l = u_intensity != 0 ? dot(c.rgb, vec3(0.299, 0.587, 0.114)) : c.r;\n"
     "    if (u_fmt <= 1 || u_fmt == 8) o = vec4(l);\n"
     "    else if (u_fmt == 2 || u_fmt == 3) o = vec4(l, l, l, c.a);\n"
@@ -955,21 +1025,6 @@ static void exec_copy(const Cmd *c)
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, s_efb_tex);
         uint32_t tpf = BITS(c->trigger, 3, 4);
-        static int efb_dumped;
-        if ((s_gl_debug & 32) && !efb_dumped && s_frames >= 2500 && y0 >= 456) {
-            efb_dumped = 1;
-            int pw = EFB_W * s_scale, ph = EFB_H * s_scale;
-            uint8_t *img = malloc((size_t)pw * ph * 4), *flip = malloc((size_t)pw * ph * 4);
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, s_efb_fbo);
-            glReadPixels(0, 0, pw, ph, GL_RGBA, GL_UNSIGNED_BYTE, img);
-            for (int y = 0; y < ph; y++)
-                memcpy(flip + (size_t)y * pw * 4, img + (size_t)(ph - 1 - y) * pw * 4, (size_t)pw * 4);
-            char path[512];
-            snprintf(path, sizeof path, "%sframes/efb_full.png", plat_data_dir());
-            png_write_rgba(path, flip, pw, ph);
-            free(img);
-            free(flip);
-        }
         if (s_gl_debug & 16) {
             static int n;
             if (n++ < 200)
@@ -980,6 +1035,9 @@ static void exec_copy(const Cmd *c)
         glUniform4f(s_copy_u_src, (float)x0 / EFB_W, (float)(EFB_H - y0) / EFB_H, (float)w / EFB_W, -(float)h / EFB_H);
         glUniform1i(s_copy_u_fmt, (int)((tpf >> 1) + (tpf & 1) * 8));
         glUniform1i(s_copy_u_intensity, (int)BITS(c->trigger, 15, 1));
+        /* pixel formats 0 (RGB8_Z24) and 2 (RGB565_Z16) have no alpha: it reads as 1 */
+        uint32_t pf = BITS(c->pe_ctrl, 0, 3);
+        glUniform1i(s_copy_u_noalpha, pf == 0 || pf == 2);
         glBindVertexArray(s_copy_vao);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         glBindVertexArray(s_vao);
@@ -1196,6 +1254,7 @@ static int gl_setup(void)
     s_copy_u_src = glGetUniformLocation(s_copy_prog, "u_src");
     s_copy_u_fmt = glGetUniformLocation(s_copy_prog, "u_fmt");
     s_copy_u_intensity = glGetUniformLocation(s_copy_prog, "u_intensity");
+    s_copy_u_noalpha = glGetUniformLocation(s_copy_prog, "u_noalpha");
     glUseProgram(s_copy_prog);
     glUniform1i(glGetUniformLocation(s_copy_prog, "u_efb"), 0);
     glGenVertexArrays(1, &s_copy_vao);

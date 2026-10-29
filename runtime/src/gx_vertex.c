@@ -520,22 +520,6 @@ void gx_draw_primitive(uint8_t op, const uint8_t *data, uint32_t count)
     }
     PROF_BEGIN(tl);
     const VtxPlan *pl = draw_setup(vat);
-    {
-        /* NSMBW_DRAW_HIST: vertices per draw-size bucket, every 20000 draws */
-        static int hist = -1;
-        static uint64_t buckets[8], ndraws;
-        if (hist < 0)
-            hist = getenv("NSMBW_DRAW_HIST") != NULL;
-        if (hist) {
-            int k = count < 16 ? 0 : count < 64 ? 1 : count < 256 ? 2 : count < 1024 ? 3 : 4;
-            buckets[k] += count;
-            if (++ndraws % 20000 == 0) {
-                rt_log("[draws] verts in draws <16: %llu, <64: %llu, <256: %llu, <1024: %llu, more: %llu",
-                       buckets[0], buckets[1], buckets[2], buckets[3], buckets[4]);
-                memset(buckets, 0, sizeof buckets);
-            }
-        }
-    }
     for (uint32_t i = 0; i < count; i++) {
         RawVertex raw;
         data = load_vertex(pl, data, &raw);
