@@ -1,0 +1,50 @@
+# Guest functions replaced by native runtime code.
+# Format: <guest address hex> <C function name>   (C function: void name(PPCContext *c))
+# Addresses are for SMNE01 rev 2.
+
+# --- CPU / OS primitives (runtime/src/hle_os.c)
+OSLoadContext        hle_OSLoadContext
+OSSaveContext        hle_OSSaveContext_indirect   # direct calls get setjmp inline
+OSEnableInterrupts   hle_OSEnableInterrupts
+OSRestoreInterrupts  hle_OSRestoreInterrupts
+Config24MB           hle_nop      # BAT setup through rfi: no MMU here
+Config48MB           hle_nop
+ConfigMEM2_52MB      hle_nop
+ConfigMEM2_56MB      hle_nop
+ConfigMEM2_64MB      hle_nop
+ConfigMEM2_112MB     hle_nop
+RealMode             hle_RealMode
+
+# --- IOS client API (runtime/src/hle_ios.c)
+IOS_OpenAsync        hle_IOS_OpenAsync
+IOS_Open             hle_IOS_Open
+IOS_CloseAsync       hle_IOS_CloseAsync
+IOS_Close            hle_IOS_Close
+IOS_ReadAsync        hle_IOS_ReadAsync
+IOS_Read             hle_IOS_Read
+IOS_WriteAsync       hle_IOS_WriteAsync
+IOS_Write            hle_IOS_Write
+IOS_SeekAsync        hle_IOS_SeekAsync
+IOS_Seek             hle_IOS_Seek
+IOS_IoctlAsync       hle_IOS_IoctlAsync
+IOS_Ioctl            hle_IOS_Ioctl
+IOS_IoctlvAsync      hle_IOS_IoctlvAsync
+IOS_Ioctlv           hle_IOS_Ioctlv
+
+# --- no DSP: the audio system init/stop handshakes are skipped
+__OSInitAudioSystem  hle_nop
+__OSStopAudioSystem  hle_nop
+
+# --- Wii Remote (runtime/src/hle_input.c): no Bluetooth stack
+KPADInit               hle_KPADInit
+KPADSetConnectCallback hle_KPADSetConnectCallback
+KPADiRead              hle_KPADRead
+WPADGetStatus          hle_WPADGetStatus
+WPADProbe              hle_WPADProbe
+WPADControlMotor       hle_ret0
+
+
+# --- dynamic linking (runtime/src/hle_rel.c): RELs are pre-relocated
+OSLink                 hle_OSLink
+OSLinkFixed            hle_OSLink
+OSUnlink               hle_OSUnlink

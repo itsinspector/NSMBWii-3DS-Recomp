@@ -1,0 +1,75 @@
+# Functions identified by hand (SMNE01 rev 2). Format: <addr> <name>
+# Evidence noted per line; these override automatic names.
+80004050 __start                    # DOL entry point
+801AA800 OSInit                     # called by __start after DBInit
+800C9F90 main                       # called by __start before exit
+801B8970 __init_user                # calls __init_cpp
+801B8990 __init_cpp
+801AB020 __OSSetExceptionHandler    # table at *(r13-0x5048), index exc*4
+801B11B0 __OSSetInterruptHandler    # table at 0x80003040
+801B11E0 __OSInterruptInit          # sets PI INTMR=0xF0, HW IRQ mask
+801B1140 OSDisableInterrupts        # mfmsr/clear EE/mtmsr
+801B1610 __OSDispatchInterrupt
+801B18C0 ExternalInterruptHandler   # saves GPRs, tail-calls dispatch
+801ACE30 OSLoadContext              # restores GPRs/GQRs ... rfi
+801ACD30 OSSaveFPUContext
+801ACDA0 OSGetCurrentContext
+801ACF10 OSGetStackPointer
+801ACF80 OSClearContext
+801ACFB0 OSInitContext
+801AD070 OSDumpContext
+801AD2D0 OSSwitchFPUContext         # FP-unavailable exception handler (rfi)
+801AD360 __OSContextInit
+801A9B80 PPCMtdec                   # mtspr 22
+801A9B90 PPCSync                    # sc
+801B2740 Config24MB                 # BAT setup + rfi (OSMemory.c)
+801B27C0 Config48MB
+801B28A0 ConfigMEM2_52MB
+801B2980 ConfigMEM2_56MB
+801B2A30 ConfigMEM2_64MB
+801B2B10 ConfigMEM2_112MB
+801B2BC0 RealMode                   # mtsrr0 r3, rfi into real mode
+801B5FA0 OSGetTick                  # mftb
+80224B50 IOS_OpenAsync              # builds request cmd 1 with strlen(path)
+80225640 IOS_Ioctl
+80225770 __ios_Ioctlv
+802259A0 IOS_Ioctlv
+802260B0 iosAllocAligned
+801AC180 __OSInitAudioSystem        # OSAudioSystem.c, after __AIClockInit; waits on DSP init ucode
+801AC350 __OSStopAudioSystem
+# pinned from Dolphin signature matches / community maps (HLE depends on them)
+801ACDB0 OSSaveContext
+801B1160 OSEnableInterrupts
+801B1180 OSRestoreInterrupts
+801B50D0 __OSReschedule
+801B50F0 OSYieldThread
+801B4EA0 SelectThread               # contains the only OSSaveContext call
+801B5130 OSCreateThread
+801B53A0 OSExitThread
+801B5860 OSResumeThread
+801B5B00 OSSuspendThread
+801B4B30 OSGetCurrentThread
+801B5F80 OSGetTime
+80224C70 IOS_Open
+80224DA0 IOS_CloseAsync
+80224E60 IOS_Close
+80224F10 IOS_ReadAsync
+80225010 IOS_Read
+80225120 IOS_WriteAsync
+80225220 IOS_Write
+80225330 IOS_SeekAsync
+80225410 IOS_Seek
+80225500 IOS_IoctlAsync
+802258B0 IOS_IoctlvAsync
+801DFB10 WPADRegisterAllocator      # tail-calls WUDRegisterAllocator
+801DFB30 WPADGetStatus              # KPAD read requires == 3 (SETUP)
+801EDAF0 KPADInit                   # called by EGG::CoreControllerMgr ctor, runs WPADInit
+801EE0B0 KPADSetConnectCallback     # stores cb at kpad[chan] (stride 0x578) + 0x550
+801ED3A0 KPADRead                   # li r6,0; li r7,0; b KPADiRead
+801ED3B0 KPADReadEx                 # li r7,1; b KPADiRead
+801ED3C0 KPADiRead                  # samples stride 0x84, dev_type at +0x5C
+801A0050 AXInit                     # called from nw4r/EGG audio init, after AIInit
+801A1DD0 __AXOutInit                # AI DMA setup + DSP task
+801A1CE0 __AXOutInitDSP             # DSPInit + DSPAddTask(AX ucode), waits for the DSP
+801D5810 DSPAddTask
+801D5F70 __DSP_boot_task

@@ -1,0 +1,23 @@
+; Passthrough vertex shader: GX transform and lighting run on the CPU
+; (gx_vertex.c), so vertices arrive in final clip space.
+
+.out outpos position
+.out outclr color
+.out outtc0 texcoord0
+.out outtc1 texcoord1
+.out outtc2 texcoord2
+
+.in inpos v0
+.in inclr v1
+.in intc0 v2
+.in intc1 v3
+.in intc2 v4
+
+.proc main
+	mov outpos, inpos
+	mov outclr, inclr
+	mov outtc0, intc0
+	mov outtc1, intc1
+	mov outtc2, intc2
+	end
+.end
