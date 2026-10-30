@@ -15,6 +15,7 @@
 #include "runtime.h"
 #include "platform.h"
 
+#include <sys/stat.h>
 #ifdef _MSC_VER
 #include <io.h>
 #define unlink _unlink
@@ -28,6 +29,7 @@
 #define IPC_EEXIST   -2
 #define IPC_EINVAL   -4
 #define IPC_ENOENT   -6
+#define FS_EINVAL  -101
 #define FS_EEXIST  -105
 #define FS_ENOENT  -106
 
@@ -342,20 +344,111 @@ static int fs_ioctl(uint32_t cmd, uint32_t in, uint32_t in_len, uint32_t out, ui
     }
 }
 
+/* host path kind: 0 missing, 1 file, 2 directory */
+static int host_kind(const char *host)
+{
+    char tmp[512];
+    snprintf(tmp, sizeof tmp, "%s", host);
+    size_t n = strlen(tmp);
+    while (n > 1 && tmp[n - 1] == '/')
+        tmp[--n] = 0;
+    struct stat st;
+    if (stat(tmp, &st))
+        return 0;
+    return (st.st_mode & S_IFMT) == S_IFDIR ? 2 : 1;
+}
+
+/* names in a host directory (NAND names are at most 12 characters) */
+static int list_dir(const char *host, char names[][16], int max)
+{
+    int n = 0;
+#ifdef _MSC_VER
+    char pattern[600];
+    snprintf(pattern, sizeof pattern, "%s/*", host);
+    struct _finddata_t fd;
+    intptr_t h = _findfirst(pattern, &fd);
+    if (h == -1)
+        return 0;
+    do {
+        if (strcmp(fd.name, ".") && strcmp(fd.name, "..") && strlen(fd.name) <= 12 && n < max)
+            snprintf(names[n++], 16, "%s", fd.name);
+    } while (_findnext(h, &fd) == 0);
+    _findclose(h);
+#else
+    DIR *dir = opendir(host);
+    if (!dir)
+        return 0;
+    struct dirent *e;
+    while ((e = readdir(dir)) != NULL)
+        if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..") && strlen(e->d_name) <= 12 && n < max)
+            snprintf(names[n++], 16, "%s", e->d_name);
+    closedir(dir);
+#endif
+    return n;
+}
+
+/* clusters (16 KiB) and inodes used under a directory, itself included */
+static void dir_usage(const char *host, uint32_t *clusters, uint32_t *inodes, int depth)
+{
+    static char names[8][64][16];
+    if (depth >= 8)
+        return;
+    *inodes += 1;
+    int n = list_dir(host, names[depth], 64);
+    for (int i = 0; i < n; i++) {
+        char sub[512];
+        snprintf(sub, sizeof sub, "%s/%s", host, names[depth][i]);
+        if (host_kind(sub) == 2) {
+            dir_usage(sub, clusters, inodes, depth + 1);
+        } else {
+            struct stat st;
+            *inodes += 1;
+            if (!stat(sub, &st))
+                *clusters += (uint32_t)((st.st_size + 0x3FFF) / 0x4000);
+        }
+    }
+}
+
 static int fs_ioctlv(uint32_t cmd, int nin, int nout, uint32_t vec)
 {
-    (void)nin; (void)nout;
-    if (cmd == 4) {                 /* ReadDirectory: report empty dirs */
-        if (nout >= 1) {
-            uint32_t cnt_out = ld32(vec + 8 * (nin + nout - 1));
-            st32(cnt_out, 0);
+    char nand[128], host[512];
+    if (cmd == 4) {                 /* ReadDirectory: in path [, max], out [names,] count */
+        if (nin < 1 || nout < 1)
+            return IPC_EINVAL;
+        guest_cstr(ld32(vec), nand, 64);
+        nand_host_path(nand, host, sizeof host);
+        int kind = host_kind(host);
+        if (!kind)
+            return FS_ENOENT;
+        if (kind == 1)              /* NANDGetType tells files from directories this way */
+            return FS_EINVAL;
+        static char names[64][16];
+        int n = list_dir(host, names, 64);
+        if (nin >= 2 && nout >= 2) {
+            uint32_t max = ld32(ld32(vec + 8));
+            uint32_t list = ld32(vec + 8 * nin);
+            if ((uint32_t)n > max)
+                n = (int)max;
+            for (int i = 0; i < n; i++) {
+                uint32_t len = (uint32_t)strlen(names[i]) + 1;
+                guest_write(list, names[i], len);
+                list += len;
+            }
         }
+        st32(ld32(vec + 8 * (nin + nout - 1)), (uint32_t)n);
         return 0;
     }
-    if (cmd == 12) {                /* GetUsage */
+    if (cmd == 12) {                /* GetUsage: in path, out clusters, inodes */
+        uint32_t clusters = 0, inodes = 0;
+        if (nin >= 1) {
+            guest_cstr(ld32(vec), nand, 64);
+            nand_host_path(nand, host, sizeof host);
+            if (host_kind(host) == 2)
+                dir_usage(host, &clusters, &inodes, 0);
+        }
         if (nout >= 2) {
-            st32(ld32(vec + 8 * nin), 0);
-            st32(ld32(vec + 8 * (nin + 1)), 0);
+            st32(ld32(vec + 8 * nin), clusters);
+            st32(ld32(vec + 8 * (nin + 1)), inodes);
         }
         return 0;
     }
