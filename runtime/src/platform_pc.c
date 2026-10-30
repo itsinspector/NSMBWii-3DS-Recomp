@@ -372,6 +372,25 @@ const char *plat_data_dir(void)
 
 int plat_mkdir(const char *path) { return _mkdir(path); }
 
+/* save data: NSMBW_SAVE, else %LOCALAPPDATA%/NSMBWii */
+const char *plat_save_dir(void)
+{
+    static char dir[512];
+    if (dir[0])
+        return dir;
+    const char *env = getenv("NSMBW_SAVE"), *local = getenv("LOCALAPPDATA");
+    if (env)
+        snprintf(dir, sizeof dir, "%s", env);
+    else if (local)
+        snprintf(dir, sizeof dir, "%s/NSMBWii", local);
+    else
+        snprintf(dir, sizeof dir, "%snand", plat_data_dir());
+    for (char *p = dir; *p; p++)
+        if (*p == 0x5C)              /* backslash */
+            *p = '/';
+    return dir;
+}
+
 int plat_frame(void)
 {
     static int frames;

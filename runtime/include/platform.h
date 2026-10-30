@@ -21,7 +21,8 @@ void plat_sleep_us(uint32_t us);
 uint32_t plat_cpu_count(void);
 
 void plat_log_write(const char *line); /* one line, no newline */
-const char *plat_data_dir(void);       /* writable data: nand/, log, frame dumps */
+const char *plat_data_dir(void);       /* writable data: log, frame dumps */
+const char *plat_save_dir(void);       /* the emulated NAND (save data), no trailing slash */
 const char *plat_asset_dir(void);      /* read-only game files: game.iso, rel_image.bin */
 int plat_mkdir(const char *path);
 

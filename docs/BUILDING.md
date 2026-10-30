@@ -79,7 +79,7 @@ copy build\gen\rel_image.bin pcdata\rel_image.bin
 Instead of copying the ISO you can hard-link it to save 350 MB:
 `mklink /H pcdata\game.iso nsmbwii.iso` from the Command Prompt.
 
-The NAND with the saves (`pcdata/nand/`) is created on first run.
+Saves go to `%LOCALAPPDATA%\NSMBWii\` (set `NSMBW_SAVE` to use another folder); the folder is created on first run.
 
 ### 3.3 Run
 
@@ -140,7 +140,7 @@ The first build takes a good while (the generated code is large).
 2. If you used `make cia` (not `cia-full`), also copy the data to the SD card:
    `sdmc:/3ds/nsmbw/game.iso` and `sdmc:/3ds/nsmbw/rel_image.bin`.
 3. Audio needs `sdmc:/3ds/dspfirm.cdc` (dump it from your console with DSP1).
-4. Start the game from the HOME Menu. Saves and the log go to `sdmc:/3ds/nsmbw/`.
+4. Start the game from the HOME Menu. Saves go to `sdmc:/3ds/nsmbw/save/`, the log to `sdmc:/3ds/nsmbw/log.txt`.
 
 ### 4.4 Try it in Azahar
 

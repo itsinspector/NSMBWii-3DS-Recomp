@@ -82,6 +82,10 @@ const char *plat_asset_dir(void)
 
 int plat_mkdir(const char *path) { return mkdir(path, 0777); }
 
+/* save data on the SD card, next to the game files: it survives reinstalling
+ * the CIA and is easy to back up */
+const char *plat_save_dir(void) { return "sdmc:/3ds/nsmbw/save"; }
+
 int plat_frame(void)
 {
     if (!aptMainLoop())

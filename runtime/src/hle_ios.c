@@ -4,8 +4,8 @@
  * immediately and queue the callback, which runs as if from the IPC
  * interrupt. Devices:
  *   /dev/di      disc reads from the ISO
- *   /dev/fs      ISFS directory/attribute ioctls on <data>/nand/
- *   /<path>      NAND files (SYSCONF, save data) on <data>/nand/<path>
+ *   /dev/fs      ISFS directory/attribute ioctls on the save directory (plat_save_dir)
+ *   /<path>      NAND files (SYSCONF, save data) under the save directory
  *   /dev/es      title ID / data dir
  *   /dev/stm/... power events (eventhook never fires)
  */
@@ -47,7 +47,7 @@ static Fd s_fds[MAX_FD];
 
 static void nand_host_path(const char *nand, char *out, size_t n)
 {
-    snprintf(out, n, "%snand%s", plat_data_dir(), nand);
+    snprintf(out, n, "%s%s", plat_save_dir(), nand);
 }
 
 static void guest_cstr(uint32_t addr, char *out, size_t n)
@@ -515,9 +515,49 @@ void hle_IOS_IoctlvAsync(PPCContext *c)
     c->r[3] = 0;
 }
 
+/* NSMBW's save (title SMNE, 00010000/534d4e45) */
+static const char *const k_save_files[] = {
+    "/title/00010000/534d4e45/data/wiimj2d.sav",
+    "/title/00010000/534d4e45/data/banner.bin",
+};
+
+/* saves used to live in <data>/nand: carry them over once */
+static void migrate_saves(void)
+{
+    for (size_t i = 0; i < sizeof k_save_files / sizeof k_save_files[0]; i++) {
+        char from[512], to[512];
+        snprintf(from, sizeof from, "%snand%s", plat_data_dir(), k_save_files[i]);
+        nand_host_path(k_save_files[i], to, sizeof to);
+        if (!strcmp(from, to))
+            continue;
+        FILE *t = fopen(to, "rb");
+        if (t) {
+            fclose(t);
+            continue;
+        }
+        FILE *f = fopen(from, "rb");
+        if (!f)
+            continue;
+        mkdirs_for(to);
+        t = fopen(to, "wb");
+        if (t) {
+            char buf[4096];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof buf, f)) > 0)
+                fwrite(buf, 1, n, t);
+            fclose(t);
+            rt_log("save: copied %s to %s", from, to);
+        }
+        fclose(f);
+    }
+}
+
 void ios_init(void)
 {
     char host[512];
     nand_host_path("/", host, sizeof host);
+    mkdirs_for(host);
     plat_mkdir(host);
+    migrate_saves();
+    rt_log("save data in %s", plat_save_dir());
 }
