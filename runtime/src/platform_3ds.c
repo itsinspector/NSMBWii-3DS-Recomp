@@ -6,6 +6,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include "platform.h"
+#include "runtime.h"
 
 /* Recompiled code nests host calls as deep as the guest call stack. */
 u32 __stacksize__ = 1024 * 1024;
@@ -22,12 +23,127 @@ plat_sem *plat_sem_create(void)
 void plat_sem_wait(plat_sem *s) { LightSemaphore_Acquire(&s->s, 1); }
 void plat_sem_post(plat_sem *s) { LightSemaphore_Release(&s->s, 1); }
 
+/* ---- crashes: every thread gets an exception handler that writes
+ * sdmc:/3ds/nsmbw/crash.txt (ARM registers, guest state) and exits */
+static char s_report[8192];
+static size_t s_report_len;
+
+static void report_line(const char *line)
+{
+    size_t n = strlen(line);
+    if (s_report_len + n + 1 >= sizeof s_report)
+        return;
+    memcpy(s_report + s_report_len, line, n);
+    s_report_len += n;
+    s_report[s_report_len++] = '\n';
+}
+
+/* straight to the FS service: newlib's stdio lock may be held by the thread
+ * that crashed or hung */
+static void report_write(const char *name)
+{
+    char path[64];
+    snprintf(path, sizeof path, "/3ds/nsmbw/%s", name);
+    Handle f;
+    if (R_FAILED(FSUSER_OpenFileDirectly(&f, ARCHIVE_SDMC, fsMakePath(PATH_EMPTY, ""), fsMakePath(PATH_ASCII, path),
+                                         FS_OPEN_WRITE | FS_OPEN_CREATE, 0)))
+        return;
+    u32 written;
+    FSFILE_SetSize(f, 0);
+    FSFILE_Write(f, &written, 0, s_report, (u32)s_report_len, FS_WRITE_FLUSH);
+    FSFILE_Close(f);
+}
+
+static void crash_handler(ERRF_ExceptionInfo *e, CpuRegisters *r)
+{
+    static const char *const kind[] = {"prefetch abort", "data abort", "undefined instruction", "VFP"};
+    char buf[160];
+    s_report_len = 0;
+    snprintf(buf, sizeof buf, "%s at pc %08lX, fault address %08lX (fsr %08lX)",
+             e->type < 4 ? kind[e->type] : "exception", (unsigned long)r->pc, (unsigned long)e->far,
+             (unsigned long)e->fsr);
+    report_line(buf);
+    for (int i = 0; i < 13; i += 4) {
+        snprintf(buf, sizeof buf, "r%-2d %08lX %08lX %08lX %08lX", i, (unsigned long)r->r[i],
+                 (unsigned long)(i + 1 < 13 ? r->r[i + 1] : 0), (unsigned long)(i + 2 < 13 ? r->r[i + 2] : 0),
+                 (unsigned long)(i + 3 < 13 ? r->r[i + 3] : 0));
+        report_line(buf);
+    }
+    snprintf(buf, sizeof buf, "sp %08lX lr %08lX cpsr %08lX  (host addresses: arm-none-eabi-addr2line -e nsmbw3ds.elf)",
+             (unsigned long)r->sp, (unsigned long)r->lr, (unsigned long)r->cpsr);
+    report_line(buf);
+    snprintf(buf, sizeof buf, "graphics stage %lu", (unsigned long)g_gfx_stage);
+    report_line(buf);
+    rt_crash_report(report_line);
+    report_write("crash.txt");
+    svcExitProcess();
+}
+
+#define CRASH_STACK (16 * 1024)
+
+static void catch_crashes(void)
+{
+    void *stack = malloc(CRASH_STACK);
+    if (stack)
+        threadOnException(crash_handler, (u8 *)stack + CRASH_STACK, WRITE_DATA_TO_HANDLER_STACK);
+}
+
+/* hangs: no presented frame for 30 s writes hang.txt once (graphics stage,
+ * guest thread, last guest functions) */
+volatile uint32_t g_gfx_stage, g_progress;
+
+static void watchdog(void *arg)
+{
+    (void)arg;
+    uint32_t last = g_progress, still = 0;
+    for (;;) {
+        svcSleepThread(5000000000LL);
+        if (g_progress != last) {
+            last = g_progress;
+            still = 0;
+            continue;
+        }
+        if (++still != 6)
+            continue;
+        char buf[96];
+        s_report_len = 0;
+        snprintf(buf, sizeof buf, "no frame for 30 s: graphics stage %lu, frames %lu", (unsigned long)g_gfx_stage,
+                 (unsigned long)g_progress);
+        report_line(buf);
+        rt_crash_report(report_line);
+        report_write("hang.txt");
+    }
+}
+
+typedef struct { void (*fn)(void *); void *arg; } ThreadStart;
+
+static void thread_entry(void *p)
+{
+    ThreadStart s = *(ThreadStart *)p;
+    free(p);
+    catch_crashes();
+    s.fn(s.arg);
+}
+
+static Thread create_thread(void (*fn)(void *), void *arg, uint32_t stack_size, s32 prio)
+{
+    ThreadStart *s = malloc(sizeof *s);
+    if (!s)
+        return NULL;
+    s->fn = fn;
+    s->arg = arg;
+    Thread t = threadCreate(thread_entry, s, stack_size, prio, -2, true);
+    if (!t)
+        free(s);
+    return t;
+}
+
 int plat_thread_start(void (*fn)(void *), void *arg, uint32_t stack_size)
 {
     s32 prio = 0x30;
     svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
     /* same core as the main thread: guest threads never run concurrently */
-    Thread t = threadCreate(fn, arg, stack_size, prio, -2, true);
+    Thread t = create_thread(fn, arg, stack_size, prio);
     return t ? 0 : -1;
 }
 
@@ -35,7 +151,7 @@ int plat_service_thread_start(void (*fn)(void *), void *arg, uint32_t stack_size
 {
     s32 prio = 0x30;
     svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
-    Thread t = threadCreate(fn, arg, stack_size, prio > 0x19 ? prio - 1 : prio, -2, true);
+    Thread t = create_thread(fn, arg, stack_size, prio > 0x19 ? prio - 1 : prio);
     return t ? 0 : -1;
 }
 
@@ -163,6 +279,8 @@ void rt_main(void);
 int main(void)
 {
     osSetSpeedupEnable(true);
+    catch_crashes();
+    threadCreate(watchdog, NULL, 16 * 1024, 0x18, -2, true);
     gfxInitDefault();
     consoleInit(GFX_BOTTOM, NULL);
     s_romfs = R_SUCCEEDED(romfsInit());

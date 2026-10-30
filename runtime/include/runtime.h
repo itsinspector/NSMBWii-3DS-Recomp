@@ -60,11 +60,22 @@ uint64_t plat_time_us(void);
 extern uint64_t g_prof_us[PROF_SLOTS];
 #define PROF_BEGIN(name) uint64_t prof_t0_##name = plat_time_us()
 #define PROF_END(name, slot) (g_prof_us[slot] += plat_time_us() - prof_t0_##name)
+/* per-primitive sections: the clock is an SVC, so time one primitive in 8
+ * (g_prof_tick, advanced per primitive) and scale */
+extern uint32_t g_prof_tick;
+#define PROF_SBEGIN(name) uint64_t prof_t0_##name = (g_prof_tick & 7) ? 0 : plat_time_us()
+#define PROF_SEND(name, slot) \
+    (prof_t0_##name ? (void)(g_prof_us[slot] += (plat_time_us() - prof_t0_##name) * 8) : (void)0)
 #else
 #define PROF_BEGIN(name) ((void)0)
 #define PROF_END(name, slot) ((void)0)
+#define PROF_SBEGIN(name) ((void)0)
+#define PROF_SEND(name, slot) ((void)0)
 #endif
 void rt_prof_frame(void);
+void rt_crash_report(void (*out)(const char *line));
+/* 3DS hang/crash reports: where the graphics backend is, and frames shown */
+extern volatile uint32_t g_gfx_stage, g_progress;
 void rt_raise(void);               /* something became deliverable */
 
 /* hw.c: hardware registers */

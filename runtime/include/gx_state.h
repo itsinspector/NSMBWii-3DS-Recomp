@@ -21,6 +21,9 @@ typedef struct {
 } GXState;
 
 extern GXState g_gx;
+/* bumped by writes that change draw state (BP, XF registers, CP matrix
+ * indices) and by XF memory writes (matrices): equal counters, same state */
+extern uint32_t g_gx_state_gen, g_gx_xfmem_gen;
 
 /* --- XF registers (index from 0x1000) */
 #define XF_NUM_COLORS    0x09

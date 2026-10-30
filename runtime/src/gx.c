@@ -29,9 +29,13 @@ static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | p[1] << 1
 
 extern int g_gx_vtx_dirty;   /* gx_vertex.c: per-draw setup must be recomputed */
 
+uint32_t g_gx_state_gen, g_gx_xfmem_gen;
+
 static void cp_write(uint8_t reg, uint32_t v)
 {
     g_gx_vtx_dirty = 1;
+    if (reg == 0x30 || reg == 0x40)
+        g_gx_state_gen++;
     if (reg == 0x30) g_gx.cp_matidx_a = v;
     else if (reg == 0x40) g_gx.cp_matidx_b = v;
     else if (reg == 0x50) g_gx.cp_vcd_lo = v;
@@ -46,10 +50,12 @@ static void xf_write(uint32_t addr, uint32_t v)
     if (addr < 0x1000) {
         g_gx.xf_mem[addr] = v;
         g_gx.xf_memf[addr] = gx_xf_float(v);
+        g_gx_xfmem_gen++;
     }
     else if (addr < 0x1058) {
         g_gx.xf_regs[addr - 0x1000] = v;
         g_gx_vtx_dirty = 1;
+        g_gx_state_gen++;
     }
 }
 
@@ -113,6 +119,8 @@ static void bp_write(uint32_t reg, uint32_t v)
     }
     g_gx.bp[reg] = (g_gx.bp[reg] & ~s_bp_mask) | (v & s_bp_mask);
     s_bp_mask = 0xFFFFFF;
+    if (reg < 0x45 || reg > 0x53)            /* tokens and EFB copy setup are not draw state */
+        g_gx_state_gen++;
     v = g_gx.bp[reg];
     switch (reg) {
     case 0x45: case 0x47: case 0x48:

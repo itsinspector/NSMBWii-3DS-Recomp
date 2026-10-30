@@ -36,7 +36,8 @@ static DVLB_s *s_dvlb, *s_dvlb_tl;
 static shaderProgram_s s_prog, s_prog_tl;
 static C3D_AttrInfo s_attr, s_attr_tl;
 static int s_cur_prog;            /* 0 passthrough, 1 GPU transform */
-static uint32_t s_tl_count[5];    /* draws per path, logged every 120 frames */
+static uint32_t s_tl_count[7];    /* primitives per path, mid-frame splits, GPU draws; per 120 frames */
+static void batch_flush(void);
 
 /* GPU transform: vertex layout and uniform locations (vshader_tl.v.pica) */
 typedef struct {
@@ -295,9 +296,11 @@ static void begin_frame(void)
 {
     if (s_in_frame)
         return;
+    g_gfx_stage = 1;              /* waiting for the GPU at frame start */
     PROF_BEGIN(w);
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
     PROF_END(w, PROF_GPUWAIT);
+    g_gfx_stage = 2;
 
     C3D_FrameDrawOn(s_efb_rt);
     s_vpos = 0;
@@ -315,10 +318,14 @@ static void ensure_space(uint32_t nverts, uint32_t nidx)
     GPUCMD_GetBuffer(&buf, &size, &offset);
     if (!s_in_frame || (offset < size - size / 4 && s_vpos + nverts <= VBUF_VERTS && s_ipos + nidx <= IBUF_INDICES))
         return;
+    batch_flush();
+    g_gfx_stage = 3;              /* mid-frame split */
     PROF_BEGIN(w);
     C3D_FrameEnd(0);
     C3D_FrameBegin(0);
     PROF_END(w, PROF_GPUWAIT);
+    g_gfx_stage = 4;
+    s_tl_count[5]++;
     C3D_FrameDrawOn(s_efb_rt);
     s_vpos = 0;
     s_ipos = 0;
@@ -1163,11 +1170,170 @@ static void set_scissor(void)
 
 /* unique vertices are converted once and drawn with an index list (strips
  * and quads otherwise duplicate most vertices) */
+/* ------------------------------------------------------------- batching
+ * NSMBW draws thousands of tiny primitives per frame (tile quads, model
+ * strips) and a citro3d draw costs far more than its vertices. Consecutive
+ * primitives whose state is identical are appended to one open draw, which
+ * goes out when the state changes or anything else touches the GPU (EFB
+ * copies, clears, present, a mid-frame split).
+ *
+ * The state signature is everything a draw's GPU state is derived from: the
+ * BP registers (minus copy and token registers), the XF registers, the CP
+ * matrix indices and, for the GPU transform, the texture and post matrices
+ * the texgens use. Position matrix rows are per vertex: a row the open
+ * batch uses may not change before it is drawn. */
+
+#define SIG_MAX 560
+
+typedef struct {
+    int open, tl;                 /* tl: GPU transform vertices (TLVert) */
+    uint32_t sig[SIG_MAX];
+    int nsig;
+    uint8_t *vbase;               /* first vertex */
+    uint32_t nverts, slots;       /* vertices, CVert slots they occupy */
+    u16 *ibase;
+    uint32_t nidx;
+    uint64_t rows[2];             /* GPU transform: matrix rows used (0..65) */
+    /* to append vertices without redoing the setup */
+    DrawSetup ds;
+    float scale[3][2];
+    RtMap m;
+    int mode[3];
+    uint32_t gen[3];
+    int chan, crgb, vrgb, va;
+    u8 mcol[4];
+    int reason;                   /* CPU batch: s_tl_count slot of its fallback */
+    uint32_t sgen, xgen;          /* g_gx_state_gen / g_gx_xfmem_gen its signature matches */
+} Batch;
+
+static Batch s_batch;
+static uint32_t s_sig[SIG_MAX];
+static int s_nsig;
+static uint32_t s_sig_gen = ~0u, s_sig_xgen = ~0u;   /* counters s_sig was taken at */
+static int s_fallback = 3;      /* reason of the last CPU fallback */
+
+static int state_sig(uint32_t *k, int texmtx_direct)
+{
+    int n = 0;
+    k[n++] = (uint32_t)texmtx_direct;
+    memcpy(&k[n], g_gx.bp, sizeof g_gx.bp);
+    memset(&k[n + 0x45], 0, (0x53 - 0x45 + 1) * 4);    /* tokens, EFB copy setup */
+    k[n + 0xFE] = 0;                                    /* BP write mask */
+    n += 256;
+    memcpy(&k[n], g_gx.xf_regs, sizeof g_gx.xf_regs);
+    n += (int)(sizeof g_gx.xf_regs / 4);
+    k[n++] = g_gx.cp_matidx_a;
+    k[n++] = g_gx.cp_matidx_b;
+    uint32_t ngen = g_gx.xf_regs[XF_NUM_TEXGENS] & 15;
+    int dual = g_gx.xf_regs[XF_DUALTEX] & 1;
+    for (uint32_t g = 0; g < ngen && g < 8; g++) {
+        uint32_t m = g < 4 ? BITS(g_gx.cp_matidx_a, 6 + 6 * g, 6) : BITS(g_gx.cp_matidx_b, 6 * (g - 4), 6);
+        memcpy(&k[n], &g_gx.xf_memf[(m * 4) & 0xFFF], 12 * 4);
+        n += 12;
+        if (dual) {
+            uint32_t post = BITS(g_gx.xf_regs[XF_POSTMTX0 + g], 0, 6);
+            memcpy(&k[n], &g_gx.xf_memf[0x500 + post * 4], 12 * 4);
+            n += 12;
+        }
+    }
+    return n;
+}
+
+static void current_sig(void)
+{
+    if (s_sig_gen == g_gx_state_gen && s_sig_xgen == g_gx_xfmem_gen)
+        return;
+    s_nsig = state_sig(s_sig, 0);
+    s_sig_gen = g_gx_state_gen;
+    s_sig_xgen = g_gx_xfmem_gen;
+}
+
+/* the open batch has the current state: no register written since it was
+ * checked (most primitives), else compare signatures */
+static int batch_matches(int tl)
+{
+    if (!s_batch.open || s_batch.tl != tl)
+        return 0;
+    if (s_batch.sgen == g_gx_state_gen && s_batch.xgen == g_gx_xfmem_gen)
+        return 1;
+    current_sig();
+    if (s_batch.nsig != s_nsig || memcmp(s_batch.sig, s_sig, (size_t)s_nsig * 4))
+        return 0;
+    s_batch.sgen = g_gx_state_gen;
+    s_batch.xgen = g_gx_xfmem_gen;
+    return 1;
+}
+
+static void batch_flush(void)
+{
+    if (!s_batch.open)
+        return;
+    g_gfx_stage = 5;
+    s_batch.open = 0;
+    use_program(s_batch.tl);
+    C3D_BufInfo *bi = C3D_GetBufInfo();
+    BufInfo_Init(bi);
+    if (s_batch.tl)
+        BufInfo_Add(bi, s_batch.vbase, sizeof(TLVert), 6, 0x543210);
+    else
+        BufInfo_Add(bi, s_batch.vbase, sizeof(CVert), 5, 0x43210);
+    C3D_DrawElements(GPU_TRIANGLES, (int)s_batch.nidx, C3D_UNSIGNED_SHORT, s_batch.ibase);
+    s_tl_count[6]++;
+}
+
+static void batch_open(int tl, uint8_t *vbase, uint32_t nverts, uint32_t slots, u16 *ibase, uint32_t nidx)
+{
+    current_sig();
+    s_batch.open = 1;
+    s_batch.tl = tl;
+    s_batch.sgen = g_gx_state_gen;
+    s_batch.xgen = g_gx_xfmem_gen;
+    memcpy(s_batch.sig, s_sig, (size_t)s_nsig * 4);
+    s_batch.nsig = s_nsig;
+    s_batch.vbase = vbase;
+    s_batch.nverts = nverts;
+    s_batch.slots = slots;
+    s_batch.ibase = ibase;
+    s_batch.nidx = nidx;
+    s_batch.reason = s_fallback;
+    s_fallback = 3;
+}
+
+/* the batch's vertices and indices end where the next ones would go */
+static int batch_contiguous(void)
+{
+    return s_batch.vbase + s_batch.slots * sizeof(CVert) == (uint8_t *)&s_vbuf[s_vpos] &&
+           s_batch.ibase + s_batch.nidx == &s_ibuf[s_ipos];
+}
+
+static void batch_indices(u16 *ind, const uint32_t *idx, uint32_t nidx, uint32_t base)
+{
+    for (uint32_t i = 0; i < nidx; i++)
+        ind[i] = (u16)(idx[i] + base);
+}
+
 void gfx_draw_indexed(const GXVertex *v, uint32_t nverts, const uint32_t *idx, uint32_t nidx)
 {
     if (!nidx || nverts > 0xFFFF)
         return;
     begin_frame();
+    g_gfx_stage = 7;              /* CPU transform draw */
+    if (batch_matches(0) && s_batch.nverts + nverts <= 0xFFFF) {
+        ensure_space(nverts, nidx);
+        if (s_batch.open && batch_contiguous() && s_vpos + nverts <= VBUF_VERTS && s_ipos + nidx <= IBUF_INDICES) {
+            CVert *out = &s_vbuf[s_vpos];
+            for (uint32_t i = 0; i < nverts; i++)
+                to_rt(&v[i], &s_batch.ds, s_batch.scale, &s_batch.m, &out[i]);
+            batch_indices(&s_ibuf[s_ipos], idx, nidx, s_batch.nverts);
+            s_vpos += nverts;
+            s_ipos += nidx;
+            s_batch.nverts += nverts;
+            s_batch.slots += nverts;
+            s_batch.nidx += nidx;
+            return;
+        }
+    }
+    batch_flush();
     ensure_space(nverts, nidx);
     if (s_vpos + nverts > VBUF_VERTS || s_ipos + nidx > IBUF_INDICES)
         return;
@@ -1175,23 +1341,16 @@ void gfx_draw_indexed(const GXVertex *v, uint32_t nverts, const uint32_t *idx, u
     u16 *ind = &s_ibuf[s_ipos];
     s_vpos += nverts;
     s_ipos += nidx;
-    DrawSetup ds;
-    float scale[3][2];
-    RtMap m;
-    setup_textures(&ds, scale);
-    rt_map(&m);
+    Batch *b = &s_batch;
+    setup_textures(&b->ds, b->scale);
+    rt_map(&b->m);
     for (uint32_t i = 0; i < nverts; i++)
-        to_rt(&v[i], &ds, scale, &m, &out[i]);
-    for (uint32_t i = 0; i < nidx; i++)
-        ind[i] = (u16)idx[i];
-    apply_program(cached_program(&ds));
+        to_rt(&v[i], &b->ds, b->scale, &b->m, &out[i]);
+    batch_indices(ind, idx, nidx, 0);
+    apply_program(cached_program(&b->ds));
     apply_fragment_ops();
     set_scissor();
-    use_program(0);
-    C3D_BufInfo *bi = C3D_GetBufInfo();
-    BufInfo_Init(bi);
-    BufInfo_Add(bi, out, sizeof(CVert), 5, 0x43210);
-    C3D_DrawElements(GPU_TRIANGLES, (int)nidx, C3D_UNSIGNED_SHORT, ind);
+    batch_open(0, (uint8_t *)out, nverts, nverts, ind, nidx);
 }
 
 /* ------------------------------------------------------- GPU transform */
@@ -1233,17 +1392,128 @@ static void tl_projection(void)
         unif4(s_tl.proj + i, r[i]);
 }
 
-/* matrix memory rows a position matrix uses, uploaded when they changed */
-static void tl_matrix_rows(uint32_t row)
+/* matrix memory rows a position matrix index covers */
+static void rows_add(uint64_t *m, uint32_t base)
 {
-    for (uint32_t r = row; r < row + 3 && r < 66; r++) {
-        const float *f = &g_gx.xf_memf[r * 4];
-        if (s_tl.valid[r] && !memcmp(s_tl.shadow[r], f, 16))
-            continue;
-        memcpy(s_tl.shadow[r], f, 16);
-        s_tl.valid[r] = 1;
-        unif4(s_tl.mtx + (int)r, f);
+    for (uint32_t r = base; r < base + 3 && r < 66; r++)
+        m[r >> 6] |= 1ull << (r & 63);
+}
+
+static int row_stale(uint32_t r)
+{
+    return !s_tl.valid[r] || memcmp(s_tl.shadow[r], &g_gx.xf_memf[r * 4], 16);
+}
+
+/* rows in both masks whose uploaded value no longer matches XF memory */
+static int rows_conflict(const uint64_t *a, const uint64_t *b)
+{
+    for (int w = 0; w < 2; w++)
+        for (uint64_t m = a[w] & b[w]; m; m &= m - 1)
+            if (row_stale((uint32_t)(w * 64 + __builtin_ctzll(m))))
+                return 1;
+    return 0;
+}
+
+static void rows_upload(const uint64_t *mask)
+{
+    for (int w = 0; w < 2; w++)
+        for (uint64_t m = mask[w]; m; m &= m - 1) {
+            uint32_t r = (uint32_t)(w * 64 + __builtin_ctzll(m));
+            if (!row_stale(r))
+                continue;
+            memcpy(s_tl.shadow[r], &g_gx.xf_memf[r * 4], 16);
+            s_tl.valid[r] = 1;
+            unif4(s_tl.mtx + (int)r, &g_gx.xf_memf[r * 4]);
+        }
+}
+
+static void rows_of(const GXRawVertex *v, uint32_t n, uint64_t *m)
+{
+    uint32_t last = ~0u;
+    m[0] = m[1] = 0;
+    for (uint32_t i = 0; i < n; i++)
+        if (v[i].pnmtx != last) {
+            last = v[i].pnmtx;
+            rows_add(m, last);
+        }
+}
+
+/* GPU transform vertices: position, unlit color, matrix row, texgen sources */
+static void tl_write_verts(TLVert *out, const GXRawVertex *v, uint32_t nverts)
+{
+    const Batch *b = &s_batch;
+    for (uint32_t i = 0; i < nverts; i++) {
+        const GXRawVertex *in = &v[i];
+        TLVert *o = &out[i];
+        memcpy(o->pos, in->pos, sizeof o->pos);
+        if (!b->crgb) {
+            o->col[0] = o->col[1] = o->col[2] = o->col[3] = 0;
+        } else {
+            const float *vc = in->col[b->chan];
+            if (b->vrgb) { o->col[0] = to_u8(vc[0]); o->col[1] = to_u8(vc[1]); o->col[2] = to_u8(vc[2]); }
+            else { o->col[0] = b->mcol[0]; o->col[1] = b->mcol[1]; o->col[2] = b->mcol[2]; }
+            o->col[3] = b->va ? to_u8(vc[3]) : b->mcol[3];
+        }
+        o->mtx = (float)in->pnmtx;
+        for (int u = 0; u < 3; u++) {
+            float *s = o->src[u];
+            if (b->mode[u] == 1) {
+                uint32_t g = b->gen[u], row = BITS(g, 7, 5);
+                s[2] = 1.0f;
+                switch (row) {
+                case 0: memcpy(s, in->pos, 12); break;
+                case 1: memcpy(s, in->nrm[0], 12); break;
+                case 2: memcpy(s, in->col[0], 12); break;
+                case 3: memcpy(s, in->nrm[1], 12); break;
+                case 4: memcpy(s, in->nrm[2], 12); break;
+                default:
+                    if (row >= 5 && row <= 12) { s[0] = in->tex[row - 5][0]; s[1] = in->tex[row - 5][1]; }
+                    else s[0] = s[1] = 0;
+                }
+                if (!BITS(g, 2, 1))
+                    s[2] = 1.0f;
+            } else if (b->mode[u] == 2) {
+                float tc[3];
+                gx_texgen(in, b->ds.ind[u].icoord, tc);
+                ind_coord(&b->ds.ind[u], tc, &s[0], &s[1]);
+                s[2] = 1.0f;
+            } else {
+                s[0] = s[1] = 0;
+                s[2] = 1.0f;
+            }
+        }
     }
+}
+
+static uint32_t tl_slots(uint32_t nverts)
+{
+    return (uint32_t)((nverts * sizeof(TLVert) + sizeof(CVert) - 1) / sizeof(CVert));
+}
+
+/* appends to the open GPU transform batch (same state); 0: start a new one */
+static int tl_append(const GXRawVertex *v, uint32_t nverts, const uint32_t *idx, uint32_t nidx)
+{
+    if (s_batch.nverts + nverts > 0xFFFF)
+        return 0;
+    uint64_t rows[2];
+    rows_of(v, nverts, rows);
+    if (rows_conflict(rows, s_batch.rows))
+        return 0;
+    uint32_t slots = tl_slots(s_batch.nverts + nverts) - s_batch.slots;
+    ensure_space(slots, nidx);
+    if (!s_batch.open || !batch_contiguous() || s_vpos + slots > VBUF_VERTS || s_ipos + nidx > IBUF_INDICES)
+        return 0;
+    tl_write_verts((TLVert *)s_batch.vbase + s_batch.nverts, v, nverts);
+    rows_upload(rows);
+    batch_indices(&s_ibuf[s_ipos], idx, nidx, s_batch.nverts);
+    s_vpos += slots;
+    s_ipos += nidx;
+    s_batch.slots += slots;
+    s_batch.nverts += nverts;
+    s_batch.nidx += nidx;
+    s_batch.rows[0] |= rows[0];
+    s_batch.rows[1] |= rows[1];
+    return 1;
 }
 
 int gfx_draw_raw(const GXRawVertex *v, uint32_t nverts, const uint32_t *idx, uint32_t nidx, int texmtx_direct)
@@ -1259,41 +1529,54 @@ int gfx_draw_raw(const GXRawVertex *v, uint32_t nverts, const uint32_t *idx, uin
         s_tl_count[cpu_tl ? 4 : 3]++;
         return 0;
     }
+    begin_frame();
+    g_gfx_stage = 6;              /* GPU transform draw */
+    if (batch_matches(1)) {
+        if (tl_append(v, nverts, idx, nidx)) {
+            s_tl_count[0]++;
+            return 1;
+        }
+    } else if (batch_matches(0)) {
+        s_tl_count[s_batch.reason]++;      /* same state: the same reason sends it to the CPU */
+        return 0;
+    }
+    batch_flush();
+
+    Batch *b = &s_batch;
     uint32_t nchan = g_gx.xf_regs[XF_NUM_COLORS] & 3, ngen = g_gx.xf_regs[XF_NUM_TEXGENS] & 15;
     int dual = g_gx.xf_regs[XF_DUALTEX] & 1;
-    DrawSetup ds;
-    float scale[3][2];
-    setup_textures(&ds, scale);
+    setup_textures(&b->ds, b->scale);
     /* lit colors stay on the CPU */
-    int chan = ds.chan;
+    int chan = b->ds.chan;
     uint32_t ccr = g_gx.xf_regs[XF_COLOR0_CNTRL + chan], cca = g_gx.xf_regs[XF_ALPHA0_CNTRL + chan];
     if ((uint32_t)chan < nchan && ((ccr | cca) & 2)) {
-        s_tl_count[1]++;
+        s_tl_count[s_fallback = 1]++;
         return 0;
     }
     /* per unit: 0 constant (0, 0), 1 texgen on the GPU, 2 coordinate from the CPU */
-    int mode[3] = {0, 0, 0};
-    uint32_t gen[3] = {0, 0, 0};
-    for (int u = 0; u < ds.nunits; u++) {
-        int c = ds.unit_coord[u];
-        if (ds.ind[u].on) {
-            if (BITS(g_gx.xf_regs[XF_TEXGEN0 + ds.ind[u].icoord], 4, 3)) {
-                s_tl_count[2]++;
+    for (int u = 0; u < 3; u++) {
+        b->mode[u] = 0;
+        b->gen[u] = 0;
+    }
+    for (int u = 0; u < b->ds.nunits; u++) {
+        int c = b->ds.unit_coord[u];
+        if (b->ds.ind[u].on) {
+            if (BITS(g_gx.xf_regs[XF_TEXGEN0 + b->ds.ind[u].icoord], 4, 3)) {
+                s_tl_count[s_fallback = 2]++;
                 return 0;
             }
-            mode[u] = 2;
+            b->mode[u] = 2;
         } else if ((uint32_t)c < ngen) {
-            gen[u] = g_gx.xf_regs[XF_TEXGEN0 + c];
-            if (BITS(gen[u], 4, 3)) {               /* emboss and color texgens */
-                s_tl_count[2]++;
+            b->gen[u] = g_gx.xf_regs[XF_TEXGEN0 + c];
+            if (BITS(b->gen[u], 4, 3)) {            /* emboss and color texgens */
+                s_tl_count[s_fallback = 2]++;
                 return 0;
             }
-            mode[u] = 1;
+            b->mode[u] = 1;
         }
     }
 
-    begin_frame();
-    uint32_t slots = (uint32_t)((nverts * sizeof(TLVert) + sizeof(CVert) - 1) / sizeof(CVert));
+    uint32_t slots = tl_slots(nverts);
     ensure_space(slots, nidx);
     if (s_vpos + slots > VBUF_VERTS || s_ipos + nidx > IBUF_INDICES)
         return 1;
@@ -1307,13 +1590,13 @@ int gfx_draw_raw(const GXRawVertex *v, uint32_t nverts, const uint32_t *idx, uin
     static const float id[2][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}};
     for (int u = 0; u < 3; u++) {
         int proj = 0, dl = 0, nrm = 0;
-        if (mode[u] == 1) {
-            uint32_t m = v[0].texmtx[ds.unit_coord[u]] * 4;
+        if (b->mode[u] == 1) {
+            uint32_t m = v[0].texmtx[b->ds.unit_coord[u]] * 4;
             for (int r = 0; r < 3; r++)
                 unif4(s_tl.tm + u * 3 + r, &g_gx.xf_memf[(m + r * 4) & 0xFFF]);
-            proj = (int)BITS(gen[u], 1, 1);
+            proj = (int)BITS(b->gen[u], 1, 1);
             if (dual) {
-                uint32_t post = g_gx.xf_regs[XF_POSTMTX0 + ds.unit_coord[u]];
+                uint32_t post = g_gx.xf_regs[XF_POSTMTX0 + b->ds.unit_coord[u]];
                 dl = 1;
                 nrm = (int)BITS(post, 8, 1);
                 for (int r = 0; r < 3; r++)
@@ -1326,74 +1609,29 @@ int gfx_draw_raw(const GXRawVertex *v, uint32_t nverts, const uint32_t *idx, uin
         C3D_BoolUnifSet(GPU_VERTEX_SHADER, s_tl.b_proj + u, proj);
         C3D_BoolUnifSet(GPU_VERTEX_SHADER, s_tl.b_dual + u, dl);
         C3D_BoolUnifSet(GPU_VERTEX_SHADER, s_tl.b_norm + u, nrm);
-        int flip = u < ds.nunits && ds.unit_flip[u];
-        float t[4] = {scale[u][0], flip ? -scale[u][1] : scale[u][1], flip ? 1.0f : 0.0f, 0};
+        int flip = u < b->ds.nunits && b->ds.unit_flip[u];
+        float t[4] = {b->scale[u][0], flip ? -b->scale[u][1] : b->scale[u][1], flip ? 1.0f : 0.0f, 0};
         unif4(s_tl.tcs + u, t);
     }
 
     /* colors: material register or vertex color (unlit) */
     float mat[4];
     unpack_color(g_gx.xf_regs[XF_MATERIAL0 + chan], mat);
-    int crgb = (uint32_t)chan < nchan, vrgb = ccr & 1, va = cca & 1;
-    u8 mcol[4] = {to_u8(mat[0]), to_u8(mat[1]), to_u8(mat[2]), to_u8(mat[3])};
+    b->chan = chan;
+    b->crgb = (uint32_t)chan < nchan;
+    b->vrgb = ccr & 1;
+    b->va = cca & 1;
+    for (int k = 0; k < 4; k++)
+        b->mcol[k] = to_u8(mat[k]);
 
-    uint64_t rows = 0;
-    for (uint32_t i = 0; i < nverts; i++) {
-        const GXRawVertex *in = &v[i];
-        TLVert *o = &out[i];
-        memcpy(o->pos, in->pos, sizeof o->pos);
-        if (!crgb) {
-            o->col[0] = o->col[1] = o->col[2] = o->col[3] = 0;
-        } else {
-            const float *vc = in->col[chan];
-            if (vrgb) { o->col[0] = to_u8(vc[0]); o->col[1] = to_u8(vc[1]); o->col[2] = to_u8(vc[2]); }
-            else { o->col[0] = mcol[0]; o->col[1] = mcol[1]; o->col[2] = mcol[2]; }
-            o->col[3] = va ? to_u8(vc[3]) : mcol[3];
-        }
-        o->mtx = (float)in->pnmtx;
-        rows |= 1ull << in->pnmtx;
-        for (int u = 0; u < 3; u++) {
-            float *s = o->src[u];
-            if (mode[u] == 1) {
-                uint32_t g = gen[u], row = BITS(g, 7, 5);
-                s[2] = 1.0f;
-                switch (row) {
-                case 0: memcpy(s, in->pos, 12); break;
-                case 1: memcpy(s, in->nrm[0], 12); break;
-                case 2: memcpy(s, in->col[0], 12); break;
-                case 3: memcpy(s, in->nrm[1], 12); break;
-                case 4: memcpy(s, in->nrm[2], 12); break;
-                default:
-                    if (row >= 5 && row <= 12) { s[0] = in->tex[row - 5][0]; s[1] = in->tex[row - 5][1]; }
-                    else s[0] = s[1] = 0;
-                }
-                if (!BITS(g, 2, 1))
-                    s[2] = 1.0f;
-            } else if (mode[u] == 2) {
-                float tc[3];
-                gx_texgen(in, ds.ind[u].icoord, tc);
-                ind_coord(&ds.ind[u], tc, &s[0], &s[1]);
-                s[2] = 1.0f;
-            } else {
-                s[0] = s[1] = 0;
-                s[2] = 1.0f;
-            }
-        }
-    }
-    for (uint32_t r = 0; r < 64; r++)
-        if (rows >> r & 1)
-            tl_matrix_rows(r);
-    for (uint32_t i = 0; i < nidx; i++)
-        ind[i] = (u16)idx[i];
-
-    apply_program(cached_program(&ds));
+    tl_write_verts(out, v, nverts);
+    rows_of(v, nverts, b->rows);
+    rows_upload(b->rows);
+    batch_indices(ind, idx, nidx, 0);
+    apply_program(cached_program(&b->ds));
     apply_fragment_ops();
     set_scissor();
-    use_program(1);
-    C3D_BufInfo *bi = C3D_GetBufInfo();
-    BufInfo_Init(bi);
-    BufInfo_Add(bi, out, sizeof(TLVert), 6, 0x543210);
-    C3D_DrawElements(GPU_TRIANGLES, (int)nidx, C3D_UNSIGNED_SHORT, ind);
+    batch_open(1, (uint8_t *)out, nverts, slots, ind, nidx);
     s_tl_count[0]++;
     return 1;
 }
@@ -1573,6 +1811,8 @@ static void clear_rect(int x0, int y0, int w, int h)
 
 void gfx_efb_copy(uint32_t trigger)
 {
+    batch_flush();
+    g_gfx_stage = 8;              /* EFB copy */
     uint32_t tl = g_gx.bp[BP_EFB_TL], sz = g_gx.bp[BP_EFB_SIZE];
     int x0 = (int)BITS(tl, 0, 10), y0 = (int)BITS(tl, 10, 10);
     int w = (int)BITS(sz, 0, 10) + 1, h = (int)BITS(sz, 10, 10) + 1;
@@ -1591,6 +1831,7 @@ void gfx_texture_will_change(void) {}
 
 void gfx_present(void)
 {
+    batch_flush();
     begin_frame();
     uint32_t sz = g_gx.bp[BP_EFB_SIZE];
     int w = (int)BITS(sz, 0, 10) + 1, h = (int)BITS(sz, 10, 10) + 1;
@@ -1619,13 +1860,23 @@ void gfx_present(void)
         C3D_TexBind(0, &s_efb_tex);
         draw_verts(q, 6);
     }
+    g_gfx_stage = 9;              /* present */
     C3D_FrameEnd(0);
     s_in_frame = 0;
     s_frame++;
+    g_progress++;
+    g_gfx_stage = 0;
     if (s_frame % 120 == 0) {
-        rt_log("[tl] draws: %lu on the GPU, CPU: %lu lit, %lu color/emboss texgen, %lu texmtx per vertex, %lu forced",
-               (unsigned long)s_tl_count[0], (unsigned long)s_tl_count[1], (unsigned long)s_tl_count[2],
-               (unsigned long)s_tl_count[3], (unsigned long)s_tl_count[4]);
+        rt_log("[tl] per frame: %lu GPU draws for %lu primitives (%lu GPU transform; CPU: %lu lit, %lu color/emboss "
+               "texgen, %lu texmtx per vertex, %lu forced), %.2f mid-frame splits",
+               (unsigned long)(s_tl_count[6] / 120),
+               (unsigned long)((s_tl_count[0] + s_tl_count[1] + s_tl_count[2] + s_tl_count[3] + s_tl_count[4]) / 120),
+               (unsigned long)(s_tl_count[0] / 120), (unsigned long)(s_tl_count[1] / 120),
+               (unsigned long)(s_tl_count[2] / 120), (unsigned long)(s_tl_count[3] / 120),
+               (unsigned long)(s_tl_count[4] / 120), s_tl_count[5] / 120.0);
+        rt_log("[mem] GPU %.1f ms drawing per frame, linear free %lu KiB, VRAM free %lu KiB, GPU textures %lu KiB",
+               C3D_GetDrawingTime(), (unsigned long)(linearSpaceFree() >> 10), (unsigned long)(vramSpaceFree() >> 10),
+               (unsigned long)(s_gtex_bytes >> 10));
         memset(s_tl_count, 0, sizeof s_tl_count);
     }
     rt_prof_frame();

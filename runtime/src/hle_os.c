@@ -64,7 +64,7 @@ void rt_log(const char *fmt, ...)
     plat_log_write(buf);
 }
 
-#ifdef RT_TRACE_ENABLED
+#ifdef RT_TRACE_RING
 uint32_t g_trace_ring[1024];
 uint32_t g_trace_pos;
 #endif
@@ -247,6 +247,7 @@ void rt_raise(void) { g_rt_pending = 1; }
 
 #ifdef __3DS__
 uint64_t g_prof_us[PROF_SLOTS];
+uint32_t g_prof_tick;
 #endif
 
 /* called once per presented frame by the 3DS backend */
@@ -361,6 +362,28 @@ static HostThread *s_cur;        /* baton holder */
 
 /* cpu is the first member: the baton holder's guest registers */
 static HostThread *s_cur_for_dump(void) { return s_cur; }
+
+/* for a host crash handler: the guest thread running and the last guest
+ * functions entered, oldest first */
+void rt_crash_report(void (*out)(const char *line))
+{
+    char buf[160];
+    HostThread *t = s_cur_for_dump();
+    if (t) {
+        snprintf(buf, sizeof buf, "guest thread %d: lr %08lX r1 %08lX r3 %08lX ctr %08lX", t->id,
+                 (unsigned long)t->cpu.lr, (unsigned long)t->cpu.r[1], (unsigned long)t->cpu.r[3],
+                 (unsigned long)t->cpu.ctr);
+        out(buf);
+    }
+#ifdef RT_TRACE_RING
+    out("last guest functions entered:");
+    for (uint32_t k = 32; k > 0; k--) {
+        uint32_t a = g_trace_ring[(g_trace_pos - k) & 1023], off;
+        snprintf(buf, sizeof buf, "  %08lX %s", (unsigned long)a, symbol_name(a, &off));
+        out(buf);
+    }
+#endif
+}
 static HostThread *s_threads;
 static int s_nthreads;
 

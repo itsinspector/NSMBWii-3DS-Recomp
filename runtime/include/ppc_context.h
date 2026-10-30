@@ -167,7 +167,9 @@ static inline void ppc_dcbz(uint32_t a) { memset(host_ptr(a & ~31u), 0, 32); }
 
 /* Function-entry trace (build with -DRT_TRACE_ENABLED): ring buffer of the last
  * guest functions entered, dumped on fatal errors. */
-#ifdef RT_TRACE_ENABLED
+#if defined(RT_TRACE_ENABLED) || defined(__3DS__)
+/* on 3DS always: crash reports list the last guest functions entered */
+#define RT_TRACE_RING 1
 extern uint32_t g_trace_ring[1024];
 extern uint32_t g_trace_pos;
 #define RT_TRACE(a) (g_trace_ring[g_trace_pos++ & 1023] = (a))

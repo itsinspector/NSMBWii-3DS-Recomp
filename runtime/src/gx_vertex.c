@@ -579,7 +579,10 @@ void gx_draw_primitive(uint8_t op, const uint8_t *data, uint32_t count)
         s_verts = realloc(s_verts, s_cap * sizeof *s_verts);
         s_raw = realloc(s_raw, s_cap * sizeof *s_raw);
     }
-    PROF_BEGIN(tl);
+#ifdef __3DS__
+    g_prof_tick++;
+#endif
+    PROF_SBEGIN(tl);
     const VtxPlan *pl = draw_setup(vat);
     for (uint32_t i = 0; i < count; i++)
         data = load_vertex(pl, data, &s_raw[i]);
@@ -612,25 +615,25 @@ void gx_draw_primitive(uint8_t op, const uint8_t *data, uint32_t count)
         }
         break;
     }
-    PROF_END(tl, PROF_TL);
+    PROF_SEND(tl, PROF_TL);
     uint32_t nidx = (uint32_t)(o - s_idx);
 #ifdef __3DS__
     {
-        PROF_BEGIN(sub);
+        PROF_SBEGIN(sub);
         int done = gfx_draw_raw(s_raw, count, s_idx, nidx, pl->texmtx_direct != 0);
-        PROF_END(sub, PROF_SUBMIT);
+        PROF_SEND(sub, PROF_SUBMIT);
         if (done)
             return;
     }
 #endif
     {
-        PROF_BEGIN(tl);
+        PROF_SBEGIN(tl);
         prep_lights();
         for (uint32_t i = 0; i < count; i++)
             transform(&s_raw[i], &s_verts[i]);
-        PROF_END(tl, PROF_TL);
+        PROF_SEND(tl, PROF_TL);
     }
-    PROF_BEGIN(sub);
+    PROF_SBEGIN(sub);
     gfx_draw_indexed(s_verts, count, s_idx, nidx);
-    PROF_END(sub, PROF_SUBMIT);
+    PROF_SEND(sub, PROF_SUBMIT);
 }
