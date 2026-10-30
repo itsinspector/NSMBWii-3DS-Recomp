@@ -1,11 +1,11 @@
-; GX transform on the GPU (gfx_c3d.c, gfx_draw_raw): position matrix per
-; vertex (matrix memory mirrored in mtx), projection folded with the viewport
-; into proj, and texture coordinate generation for the three PICA units.
-; The CPU reads the vertices, works out unlit colors and picks each unit's
-; texgen source, so the shader only does matrix math.
+; GX transform on the GPU (gfx_c3d.c, gfx_draw_raw): position and texture
+; matrices per vertex (both live in XF matrix memory, mirrored in mtx),
+; projection folded with the viewport into proj, and texture coordinate
+; generation for the three PICA units. The CPU reads the vertices, works out
+; colors and picks each unit's texgen source, so the shader only does matrix
+; math.
 
-.fvec mtx[66]       ; XF matrix memory rows 0..65
-.fvec tm[9]         ; texture matrix of unit u: rows 3u..3u+2
+.fvec mtx[69]       ; XF matrix memory rows 0..65, then an identity (66..68)
 .fvec post[9]       ; dual texgen post matrix of unit u
 .fvec proj[4]       ; eye space -> render target clip space
 .fvec tcs[3]        ; unit u: (s scale, t scale, t offset, 0)
@@ -26,7 +26,7 @@
 
 .alias inpos  v0    ; model space position
 .alias inclr  v1    ; color, 0..255
-.alias inidx  v2    ; position matrix row
+.alias inidx  v2    ; matrix rows: position, texture matrix of units 0..2
 .alias insrc0 v3    ; texgen sources
 .alias insrc1 v4
 .alias insrc2 v5
@@ -50,11 +50,12 @@
 	; unit 0
 	mov r1.xyz, insrc0
 	mov r1.w, ones
-	dp4 r2.x, tm[0], r1
-	dp4 r2.y, tm[1], r1
+	mova a0.x, inidx.y
+	dp4 r2.x, mtx[a0.x], r1
+	dp4 r2.y, mtx[a0.x+1], r1
 	mov r2.z, ones
 	ifu proj0
-		dp4 r2.z, tm[2], r1
+		dp4 r2.z, mtx[a0.x+2], r1
 	.end
 	ifu dual0
 		ifu norm0
@@ -77,11 +78,12 @@
 	; unit 1
 	mov r1.xyz, insrc1
 	mov r1.w, ones
-	dp4 r2.x, tm[3], r1
-	dp4 r2.y, tm[4], r1
+	mova a0.x, inidx.z
+	dp4 r2.x, mtx[a0.x], r1
+	dp4 r2.y, mtx[a0.x+1], r1
 	mov r2.z, ones
 	ifu proj1
-		dp4 r2.z, tm[5], r1
+		dp4 r2.z, mtx[a0.x+2], r1
 	.end
 	ifu dual1
 		ifu norm1
@@ -104,11 +106,12 @@
 	; unit 2
 	mov r1.xyz, insrc2
 	mov r1.w, ones
-	dp4 r2.x, tm[6], r1
-	dp4 r2.y, tm[7], r1
+	mova a0.x, inidx.w
+	dp4 r2.x, mtx[a0.x], r1
+	dp4 r2.y, mtx[a0.x+1], r1
 	mov r2.z, ones
 	ifu proj2
-		dp4 r2.z, tm[8], r1
+		dp4 r2.z, mtx[a0.x+2], r1
 	.end
 	ifu dual2
 		ifu norm2
