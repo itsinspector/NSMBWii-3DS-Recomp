@@ -105,6 +105,9 @@ typedef struct {
 /* texture coordinate generation i on the CPU (regular texgens: matrix of a
  * position, normal or texture coordinate source) */
 void gx_texgen(const GXRawVertex *in, int i, float out[3]);
+/* lit vertex color of channel ch; gx_prep_lights() first, once per draw */
+void gx_prep_lights(void);
+void gx_light_color(const GXRawVertex *in, int ch, float out[4]);
 
 /* --- gx_texture.c */
 const GXTexture *gx_get_texture(int unit);
@@ -121,7 +124,7 @@ void gx_expand_indexed(const GXVertex *v, const uint32_t *idx, uint32_t nidx,
 void gfx_draw_triangles(const GXVertex *v, uint32_t count);   /* count vertices, 3 per triangle */
 #ifdef __3DS__
 /* model space vertices, transformed by the GPU; 0: the draw needs the CPU
- * transform (lighting, color texgens, per-vertex texture matrices) */
+ * transform (color and emboss texgens) */
 int gfx_draw_raw(const GXRawVertex *v, uint32_t nverts, const uint32_t *idx, uint32_t nidx, int texmtx_direct);
 #endif
 void gfx_efb_copy(uint32_t trigger);                         /* BP 0x52 */

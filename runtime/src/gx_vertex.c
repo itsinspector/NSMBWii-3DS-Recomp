@@ -471,6 +471,23 @@ void gx_texgen(const GXRawVertex *in, int i, float out[3])
     texgen_regular(in, i, s_xp.gen[i], out);
 }
 
+void gx_prep_lights(void) { prep_lights(); }
+
+/* lit color of channel ch (rgb and alpha), needs gx_prep_lights() */
+void gx_light_color(const GXRawVertex *in, int ch, float out[4])
+{
+    float p4[4] = {in->pos[0], in->pos[1], in->pos[2], 1.0f}, view[3], n[3] = {0, 0, 0};
+    mul34(in->pnmtx * 4, p4, view);
+    if (s_xp.need_normal) {
+        uint32_t nb = 0x400 + in->pnmtx * 3;
+        for (int r = 0; r < 3; r++)
+            n[r] = xf(nb + r * 3) * in->nrm[0][0] + xf(nb + r * 3 + 1) * in->nrm[0][1] + xf(nb + r * 3 + 2) * in->nrm[0][2];
+        normalize3(n);
+    }
+    light_channel(&s_comp[ch][0], in->col[ch], view, n, 0, out);
+    light_channel(&s_comp[ch][1], in->col[ch], view, n, 1, out);
+}
+
 int g_gx_debug_vertex;
 
 static void transform(const RawVertex *in, GXVertex *out)
