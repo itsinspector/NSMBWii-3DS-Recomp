@@ -100,6 +100,7 @@ typedef struct {
     float pos[3];
     float nrm[3][3];       /* normal, binormal, tangent */
     float col[2][4];
+    uint8_t col8[2][4];    /* the same colors as bytes */
     float tex[8][2];
 } GXRawVertex;
 /* texture coordinate generation i on the CPU (regular texgens: matrix of a

@@ -64,38 +64,69 @@ static uint32_t compute_vertex_size(int vat)
     return size;
 }
 
-/* reads n components of format fmt from host bytes p (big endian) */
-static void read_comps(const uint8_t *p, uint32_t fmt, float scale, int n, float *out)
+/* one reader per component format: the format is fixed per vertex layout,
+ * so the switch on it is decided once, not for every component */
+typedef void (*CompReader)(const uint8_t *p, float scale, int n, float *out);
+
+static void rd_u8(const uint8_t *p, float scale, int n, float *out)
 {
-    for (int i = 0; i < n; i++) {
-        switch (fmt) {
-        case 0: out[i] = p[i] * scale; break;
-        case 1: out[i] = (int8_t)p[i] * scale; break;
-        case 2: out[i] = (uint16_t)(p[2 * i] << 8 | p[2 * i + 1]) * scale; break;
-        case 3: out[i] = (int16_t)(p[2 * i] << 8 | p[2 * i + 1]) * scale; break;
-        default: {
-            uint32_t u = (uint32_t)p[4 * i] << 24 | p[4 * i + 1] << 16 | p[4 * i + 2] << 8 | p[4 * i + 3];
-            out[i] = gx_xf_float(u);
-        }
-        }
-    }
+    for (int i = 0; i < n; i++)
+        out[i] = p[i] * scale;
 }
 
-static void read_color(const uint8_t *p, uint32_t fmt, float *out)
+static void rd_s8(const uint8_t *p, float scale, int n, float *out)
 {
-    uint32_t r, g, b, a = 255;
+    for (int i = 0; i < n; i++)
+        out[i] = (int8_t)p[i] * scale;
+}
+
+static void rd_u16(const uint8_t *p, float scale, int n, float *out)
+{
+    for (int i = 0; i < n; i++)
+        out[i] = (uint16_t)(p[2 * i] << 8 | p[2 * i + 1]) * scale;
+}
+
+static void rd_s16(const uint8_t *p, float scale, int n, float *out)
+{
+    for (int i = 0; i < n; i++)
+        out[i] = (int16_t)(p[2 * i] << 8 | p[2 * i + 1]) * scale;
+}
+
+static void rd_f32(const uint8_t *p, float scale, int n, float *out)
+{
+    (void)scale;
+    for (int i = 0; i < n; i++)
+        out[i] = gx_xf_float((uint32_t)p[4 * i] << 24 | p[4 * i + 1] << 16 | p[4 * i + 2] << 8 | p[4 * i + 3]);
+}
+
+static const CompReader k_readers[8] = {rd_u8, rd_s8, rd_u16, rd_s16, rd_f32, rd_f32, rd_f32, rd_f32};
+
+/* 4/5/6-bit channels to bytes (exact: v * 255 / max, truncated) and bytes to
+ * floats: the ARM11 has no integer divide */
+static uint8_t s_c4[16], s_c5[32], s_c6[64];
+static float s_f255[256];
+
+static void color_tables(void)
+{
+    for (int i = 0; i < 16; i++) s_c4[i] = (uint8_t)(i * 17);
+    for (int i = 0; i < 32; i++) s_c5[i] = (uint8_t)(i * 255 / 31);
+    for (int i = 0; i < 64; i++) s_c6[i] = (uint8_t)(i * 255 / 63);
+    for (int i = 0; i < 256; i++) s_f255[i] = i / 255.0f;
+}
+
+static void read_color(const uint8_t *p, uint32_t fmt, uint8_t *c, float *out)
+{
     switch (fmt) {
     case 0: { uint32_t v = p[0] << 8 | p[1];
-              r = (v >> 11) * 255 / 31; g = ((v >> 5) & 63) * 255 / 63; b = (v & 31) * 255 / 31; break; }
-    case 1: case 2: r = p[0]; g = p[1]; b = p[2]; break;
+              c[0] = s_c5[v >> 11]; c[1] = s_c6[(v >> 5) & 63]; c[2] = s_c5[v & 31]; c[3] = 255; break; }
+    case 1: case 2: c[0] = p[0]; c[1] = p[1]; c[2] = p[2]; c[3] = 255; break;
     case 3: { uint32_t v = p[0] << 8 | p[1];
-              r = (v >> 12) * 17; g = ((v >> 8) & 15) * 17; b = ((v >> 4) & 15) * 17; a = (v & 15) * 17; break; }
+              c[0] = s_c4[v >> 12]; c[1] = s_c4[(v >> 8) & 15]; c[2] = s_c4[(v >> 4) & 15]; c[3] = s_c4[v & 15]; break; }
     case 4: { uint32_t v = (uint32_t)p[0] << 16 | p[1] << 8 | p[2];
-              r = (v >> 18) * 255 / 63; g = ((v >> 12) & 63) * 255 / 63; b = ((v >> 6) & 63) * 255 / 63;
-              a = (v & 63) * 255 / 63; break; }
-    default: r = p[0]; g = p[1]; b = p[2]; a = p[3]; break;
+              c[0] = s_c6[v >> 18]; c[1] = s_c6[(v >> 12) & 63]; c[2] = s_c6[(v >> 6) & 63]; c[3] = s_c6[v & 63]; break; }
+    default: c[0] = p[0]; c[1] = p[1]; c[2] = p[2]; c[3] = p[3]; break;
     }
-    out[0] = r / 255.0f; out[1] = g / 255.0f; out[2] = b / 255.0f; out[3] = a / 255.0f;
+    out[0] = s_f255[c[0]]; out[1] = s_f255[c[1]]; out[2] = s_f255[c[2]]; out[3] = s_f255[c[3]];
 }
 
 /* pointer to attribute data: direct (in the stream) or indexed (array) */
@@ -129,6 +160,7 @@ typedef struct {
     uint8_t type, fmt, n, array;     /* type: 0 none, 1 direct, 2 index8, 3 index16 */
     uint32_t size;
     float scale;
+    CompReader rd;
 } Attr;
 
 typedef struct {
@@ -161,10 +193,13 @@ static void set_attr(Attr *at, uint32_t type, uint32_t fmt, int n, float scale, 
     at->array = (uint8_t)array;
     at->scale = scale;
     at->size = n * comp_size(fmt);
+    at->rd = k_readers[fmt & 7];
 }
 
 static void build_vplan(int vat)
 {
+    if (!s_c4[1])
+        color_tables();
     VtxPlan *pl = &s_vplan[vat];
     uint32_t a = g_gx.cp_vat[0][vat], lo = g_gx.cp_vcd_lo, hi = g_gx.cp_vcd_hi;
     memset(pl, 0, sizeof *pl);
@@ -264,16 +299,13 @@ static const uint8_t *load_vertex(const VtxPlan *pl, const uint8_t *p, RawVertex
 
     v->pos[2] = 0;
     if (pl->pos.type)
-        read_comps(attr_ptr(pl->pos.type, &p, 0, tmp, pl->pos.size), pl->pos.fmt, pl->pos.scale,
-                   pl->pos.n, v->pos);
+        pl->pos.rd(attr_ptr(pl->pos.type, &p, 0, tmp, pl->pos.size), pl->pos.scale, pl->pos.n, v->pos);
     if (pl->nrm.type) {
         if (pl->nrm_idx3) {
             for (int k = 0; k < 3; k++)
-                read_comps(attr_ptr(pl->nrm.type, &p, 1, tmp, pl->nrm.size), pl->nrm.fmt, pl->nrm.scale, 3,
-                           v->nrm[k]);
+                pl->nrm.rd(attr_ptr(pl->nrm.type, &p, 1, tmp, pl->nrm.size), pl->nrm.scale, 3, v->nrm[k]);
         } else {
-            read_comps(attr_ptr(pl->nrm.type, &p, 1, tmp, pl->nrm.size), pl->nrm.fmt, pl->nrm.scale,
-                       pl->nrm.n, v->nrm[0]);
+            pl->nrm.rd(attr_ptr(pl->nrm.type, &p, 1, tmp, pl->nrm.size), pl->nrm.scale, pl->nrm.n, v->nrm[0]);
             if (pl->nrm.n == 3)
                 memset(v->nrm[1], 0, sizeof v->nrm[1] * 2);
         }
@@ -283,15 +315,17 @@ static const uint8_t *load_vertex(const VtxPlan *pl, const uint8_t *p, RawVertex
     for (int i = 0; i < 2; i++) {
         const Attr *at = &pl->col[i];
         if (at->type)
-            read_color(attr_ptr(at->type, &p, at->array, tmp, at->size), at->fmt, v->col[i]);
-        else
+            read_color(attr_ptr(at->type, &p, at->array, tmp, at->size), at->fmt, v->col8[i], v->col[i]);
+        else {
             v->col[i][0] = v->col[i][1] = v->col[i][2] = v->col[i][3] = 1.0f;
+            memset(v->col8[i], 255, 4);
+        }
     }
     for (uint32_t i = 0; i < pl->ntex; i++) {
         const Attr *at = &pl->tex[i];
         v->tex[i][1] = 0;
         if (at->type)
-            read_comps(attr_ptr(at->type, &p, at->array, tmp, at->size), at->fmt, at->scale, at->n, v->tex[i]);
+            at->rd(attr_ptr(at->type, &p, at->array, tmp, at->size), at->scale, at->n, v->tex[i]);
         else
             v->tex[i][0] = 0;
     }

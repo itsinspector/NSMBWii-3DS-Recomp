@@ -37,6 +37,7 @@ static shaderProgram_s s_prog, s_prog_tl;
 static C3D_AttrInfo s_attr, s_attr_tl;
 static int s_cur_prog;            /* 0 passthrough, 1 GPU transform */
 static uint32_t s_tl_count[7];    /* primitives per path, mid-frame splits, GPU draws; per 120 frames */
+static uint32_t s_tl_verts[2];    /* GPU transform vertices, of them with an indirect lookup */
 static void batch_flush(void);
 
 /* GPU transform: vertex layout and uniform locations (vshader_tl.v.pica) */
@@ -1455,6 +1456,9 @@ static void rows_of(const GXRawVertex *v, uint32_t n, uint64_t *m)
 static void tl_write_verts(TLVert *out, const GXRawVertex *v, uint32_t nverts)
 {
     const Batch *b = &s_batch;
+    s_tl_verts[0] += nverts;
+    if (b->mode[0] == 2 || b->mode[1] == 2 || b->mode[2] == 2)
+        s_tl_verts[1] += nverts;
     for (uint32_t i = 0; i < nverts; i++) {
         const GXRawVertex *in = &v[i];
         TLVert *o = &out[i];
@@ -1467,10 +1471,10 @@ static void tl_write_verts(TLVert *out, const GXRawVertex *v, uint32_t nverts)
             for (int k = 0; k < 4; k++)
                 o->col[k] = to_u8(c[k]);
         } else {
-            const float *vc = in->col[b->chan];
-            if (b->vrgb) { o->col[0] = to_u8(vc[0]); o->col[1] = to_u8(vc[1]); o->col[2] = to_u8(vc[2]); }
+            const u8 *vc = in->col8[b->chan];
+            if (b->vrgb) { o->col[0] = vc[0]; o->col[1] = vc[1]; o->col[2] = vc[2]; }
             else { o->col[0] = b->mcol[0]; o->col[1] = b->mcol[1]; o->col[2] = b->mcol[2]; }
-            o->col[3] = b->va ? to_u8(vc[3]) : b->mcol[3];
+            o->col[3] = b->va ? vc[3] : b->mcol[3];
         }
         o->mtx[0] = (float)in->pnmtx;
         for (int u = 0; u < 3; u++) {
@@ -1894,6 +1898,9 @@ void gfx_present(void)
                (unsigned long)(s_tl_count[0] / 120), (unsigned long)(s_tl_count[1] / 120),
                (unsigned long)(s_tl_count[2] / 120), (unsigned long)(s_tl_count[3] / 120),
                (unsigned long)(s_tl_count[4] / 120), s_tl_count[5] / 120.0);
+        rt_log("[tl] %lu vertices per frame, %lu with an indirect lookup", (unsigned long)(s_tl_verts[0] / 120),
+               (unsigned long)(s_tl_verts[1] / 120));
+        memset(s_tl_verts, 0, sizeof s_tl_verts);
         rt_log("[mem] GPU %.1f ms drawing per frame, linear free %lu KiB, VRAM free %lu KiB, GPU textures %lu KiB",
                C3D_GetDrawingTime(), (unsigned long)(linearSpaceFree() >> 10), (unsigned long)(vramSpaceFree() >> 10),
                (unsigned long)(s_gtex_bytes >> 10));
