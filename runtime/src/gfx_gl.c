@@ -1116,6 +1116,58 @@ static void exec_copy(const Cmd *c)
     }
 }
 
+/* The VI shows a frame at a retrace, not when the game copies it out:
+ * swapping at copy time follows the jitter of the game's frame time. A frame
+ * goes up at the next retrace, or right away if it is only a little late for
+ * the last one (the GX thread runs behind the game), one frame per retrace.
+ * Done after the batch is handed back, so waiting holds up nothing. */
+#define SWAP_GRACE_US 6000
+static int s_swap_pending;
+
+static void swap_at_retrace(void)
+{
+    extern uint64_t hw_next_retrace_us(void);
+    static uint64_t last_slot;
+    uint64_t next = hw_next_retrace_us(), slot = next - 16683;
+    uint64_t t = plat_time_us();
+    if (t - rt_guest_to_real_us(slot) > SWAP_GRACE_US || slot <= last_slot)
+        slot = next;
+    last_slot = slot;
+    uint64_t due = rt_guest_to_real_us(slot);
+    if (due > t && due - t < 2 * 16683) {
+        if (due - t > 1500)
+            plat_sleep_us((uint32_t)(due - t - 1000));
+        while (plat_time_us() < due)
+            YieldProcessor();
+    }
+}
+
+static void swap_at(void)
+{
+    extern uint64_t g_gl_busy_us;
+    static uint64_t t_swap, t_batch_start, acc_swap, acc_frame, n;
+    swap_at_retrace();
+    uint64_t t = plat_time_us();
+    SwapBuffers(s_dc);
+    uint64_t t2 = plat_time_us();
+    acc_swap += t2 - t;
+    if (t_batch_start)
+        acc_frame += t2 - t_batch_start;
+    t_batch_start = t2;
+    (void)t_swap;
+    if (++n == 120) {
+        extern uint64_t g_gl_phase_us[4], g_gl_counts[3];
+        rt_log("[gl] per frame: %.2f ms interval, %.2f ms busy on render thread, %.2f ms in SwapBuffers",
+               acc_frame / 120000.0, g_gl_busy_us / 120000.0, acc_swap / 120000.0);
+        rt_log("[gl]   upload %.2f, draws %.2f, copies %.2f, present %.2f ms; %llu draws, %llu verts, %llu copies",
+               g_gl_phase_us[0] / 120000.0, g_gl_phase_us[1] / 120000.0, g_gl_phase_us[2] / 120000.0,
+               g_gl_phase_us[3] / 120000.0, g_gl_counts[0] / 120, g_gl_counts[1] / 120, g_gl_counts[2] / 120);
+        memset(g_gl_phase_us, 0, sizeof g_gl_phase_us);
+        memset(g_gl_counts, 0, sizeof g_gl_counts);
+        n = acc_swap = acc_frame = g_gl_busy_us = 0;
+    }
+}
+
 static void exec_present(const Cmd *c)
 {
     int w = c->rect[2], h = c->rect[3];
@@ -1148,29 +1200,7 @@ static void exec_present(const Cmd *c)
         free(img);
         free(flip);
     }
-    {
-        extern uint64_t g_gl_busy_us;
-        static uint64_t t_swap, t_batch_start, acc_swap, acc_frame, n;
-        uint64_t t = plat_time_us();
-        SwapBuffers(s_dc);
-        uint64_t t2 = plat_time_us();
-        acc_swap += t2 - t;
-        if (t_batch_start)
-            acc_frame += t2 - t_batch_start;
-        t_batch_start = t2;
-        (void)t_swap;
-        if (++n == 120) {
-            extern uint64_t g_gl_phase_us[4], g_gl_counts[3];
-            rt_log("[gl] per frame: %.2f ms interval, %.2f ms busy on render thread, %.2f ms in SwapBuffers",
-                   acc_frame / 120000.0, g_gl_busy_us / 120000.0, acc_swap / 120000.0);
-            rt_log("[gl]   upload %.2f, draws %.2f, copies %.2f, present %.2f ms; %llu draws, %llu verts, %llu copies",
-                   g_gl_phase_us[0] / 120000.0, g_gl_phase_us[1] / 120000.0, g_gl_phase_us[2] / 120000.0,
-                   g_gl_phase_us[3] / 120000.0, g_gl_counts[0] / 120, g_gl_counts[1] / 120, g_gl_counts[2] / 120);
-            memset(g_gl_phase_us, 0, sizeof g_gl_phase_us);
-            memset(g_gl_counts, 0, sizeof g_gl_counts);
-            n = acc_swap = acc_frame = g_gl_busy_us = 0;
-        }
-    }
+    s_swap_pending = 1;
     glBindFramebuffer(GL_FRAMEBUFFER, s_efb_fbo);
     glEnable(GL_SCISSOR_TEST);
 }
@@ -1255,8 +1285,10 @@ static int gl_setup(void)
 #undef LOAD
     typedef BOOL(WINAPI * PFN_swap)(int);
     PFN_swap swap = (PFN_swap)wglGetProcAddress("wglSwapIntervalEXT");
+    /* pacing comes from the emulated VI; vsync only removes tearing */
+    const char *vs = getenv("NSMBW_VSYNC");
     if (swap)
-        swap(0);                   /* pacing comes from the emulated VI */
+        swap(vs ? atoi(vs) != 0 : 1);
 
     glGenVertexArrays(1, &s_vao);
     glBindVertexArray(s_vao);
@@ -1331,6 +1363,10 @@ static void render_thread(void *arg)
         exec_batch(&s_batch[s_exec]);
         g_gl_busy_us += plat_time_us() - t0;
         plat_sem_post(s_done);
+        if (s_swap_pending) {
+            s_swap_pending = 0;
+            swap_at();
+        }
     }
 }
 

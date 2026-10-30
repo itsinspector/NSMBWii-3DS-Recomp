@@ -147,6 +147,7 @@ static uint32_t pi_cause(void)
 int hw_external_pending(void) { return (pi_cause() & s_pi_mask & ~PI_RSWST) != 0; }
 
 uint32_t hw_frame_count(void) { return s_retrace_count; }
+uint64_t hw_next_retrace_us(void) { return s_next_retrace_us; }
 
 /* -------------------------------------------------------------- GX FIFO */
 

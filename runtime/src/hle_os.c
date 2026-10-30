@@ -288,6 +288,14 @@ uint64_t rt_time_us(void)
     return s_vt_base + (r - s_rt_base) * s_vt_scale / 1024;
 }
 
+/* real (plat_time_us) time at which the guest clock reads `guest` */
+uint64_t rt_guest_to_real_us(uint64_t guest)
+{
+    if (guest <= s_vt_base)
+        return s_rt_base;
+    return s_rt_base + (guest - s_vt_base) * 1024 / s_vt_scale;
+}
+
 /* Called every 120 guest VI frames. A guest that never idles cannot keep up
  * with real time: its timer-driven threads (Wiimote, sound) then always have
  * work, never sleep, and starve the main thread. Guest time is slowed until

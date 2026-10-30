@@ -51,6 +51,7 @@ void rt_queue_callback(uint32_t fn, uint32_t arg0, uint32_t arg1);  /* "interrup
 /* Guest-visible time (VI, decrementer, AI/DSP). It follows real time but
  * slows down when the host cannot keep up, as on a slower console. */
 uint64_t rt_time_us(void);
+uint64_t rt_guest_to_real_us(uint64_t guest);
 void rt_time_adapt(void);
 /* coarse time accounting per subsystem (3DS builds; logged every 120 frames) */
 enum { PROF_TL, PROF_SUBMIT, PROF_TEX, PROF_AUDIO, PROF_GPUWAIT, PROF_IDLE, PROF_SLOTS };
