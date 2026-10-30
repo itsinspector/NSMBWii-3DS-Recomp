@@ -303,6 +303,11 @@ void plat_sleep_us(uint32_t us)
         Sleep(us / 1000);
 }
 
+int plat_gx_thread_start(void (*fn)(void *), void *arg, uint32_t stack_size)
+{
+    return plat_thread_start(fn, arg, stack_size);
+}
+
 uint32_t plat_cpu_count(void)
 {
     SYSTEM_INFO si;

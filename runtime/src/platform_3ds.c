@@ -125,14 +125,14 @@ static void thread_entry(void *p)
     s.fn(s.arg);
 }
 
-static Thread create_thread(void (*fn)(void *), void *arg, uint32_t stack_size, s32 prio)
+static Thread create_thread(void (*fn)(void *), void *arg, uint32_t stack_size, s32 prio, int core)
 {
     ThreadStart *s = malloc(sizeof *s);
     if (!s)
         return NULL;
     s->fn = fn;
     s->arg = arg;
-    Thread t = threadCreate(thread_entry, s, stack_size, prio, -2, true);
+    Thread t = threadCreate(thread_entry, s, stack_size, prio, core, true);
     if (!t)
         free(s);
     return t;
@@ -143,7 +143,7 @@ int plat_thread_start(void (*fn)(void *), void *arg, uint32_t stack_size)
     s32 prio = 0x30;
     svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
     /* same core as the main thread: guest threads never run concurrently */
-    Thread t = create_thread(fn, arg, stack_size, prio);
+    Thread t = create_thread(fn, arg, stack_size, prio, -2);
     return t ? 0 : -1;
 }
 
@@ -151,7 +151,7 @@ int plat_service_thread_start(void (*fn)(void *), void *arg, uint32_t stack_size
 {
     s32 prio = 0x30;
     svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
-    Thread t = create_thread(fn, arg, stack_size, prio > 0x19 ? prio - 1 : prio);
+    Thread t = create_thread(fn, arg, stack_size, prio > 0x19 ? prio - 1 : prio, -2);
     return t ? 0 : -1;
 }
 
@@ -162,7 +162,25 @@ uint64_t plat_time_us(void)
 
 void plat_sleep_us(uint32_t us) { svcSleepThread((s64)us * 1000); }
 
-uint32_t plat_cpu_count(void) { return 1; }
+/* core 2 belongs to the application on the New 3DS (New 3DS mode, see the
+ * rsf); the Old 3DS only shares core 1 with the system */
+static int is_new3ds(void)
+{
+    bool n = false;
+    APT_CheckNew3DS(&n);
+    return n;
+}
+
+uint32_t plat_cpu_count(void) { return is_new3ds() ? 2 : 1; }
+
+int plat_gx_thread_start(void (*fn)(void *), void *arg, uint32_t stack_size)
+{
+    s32 prio = 0x30;
+    svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    Thread t = create_thread(fn, arg, stack_size, prio, is_new3ds() ? 2 : -2);
+    rt_log("gx: graphics thread on core %d", t && is_new3ds() ? 2 : 0);
+    return t ? 0 : -1;
+}
 
 static FILE *s_log;
 

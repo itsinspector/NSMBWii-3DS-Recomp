@@ -15,6 +15,9 @@ int plat_thread_start(void (*fn)(void *), void *arg, uint32_t stack_size);
 /* a helper that sleeps most of the time but must preempt guest threads when it
  * wakes (the 3DS does not time-slice threads of equal priority) */
 int plat_service_thread_start(void (*fn)(void *), void *arg, uint32_t stack_size);
+/* the graphics pipeline (GX command processor + renderer): on a core of its
+ * own where there is one, so it runs alongside the game */
+int plat_gx_thread_start(void (*fn)(void *), void *arg, uint32_t stack_size);
 
 uint64_t plat_time_us(void);         /* monotonic microseconds */
 void plat_sleep_us(uint32_t us);

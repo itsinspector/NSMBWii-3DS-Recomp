@@ -174,7 +174,11 @@ static void full_fence(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
  * in chunks and at sync points (interrupt polls, PE/CP register reads). Draw
  * done and token interrupts are raised by the GX thread when it gets there.
  * NSMBW_GX_THREAD=0 runs it synchronously instead. */
+#ifdef __3DS__
+#define RING_SIZE (2u << 20)        /* a few tens of KiB per frame */
+#else
 #define RING_SIZE (8u << 20)
+#endif
 #define PUBLISH_CHUNK 2048
 static uint8_t *s_ring;
 static volatile uint32_t s_ring_w, s_ring_r;   /* published write / consumed read */
@@ -238,7 +242,7 @@ static void gx_put(const uint8_t *b, uint32_t n)
         if (s_gx_threaded) {
             s_ring = malloc(RING_SIZE);
             s_gx_wake = plat_sem_create();
-            if (!s_ring || plat_thread_start(gx_thread, NULL, 1024 * 1024) < 0)
+            if (!s_ring || plat_gx_thread_start(gx_thread, NULL, 1024 * 1024) < 0)
                 s_gx_threaded = 0;
         }
     }
