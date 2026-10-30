@@ -658,10 +658,39 @@ static int plan_channel(In a, In b, In c, In d, int sub, uint32_t bias, Op *ops)
     return 2;
 }
 
-/* resolves an In to a PICA source/operand for stage `cur`; constants
- * (ONE/HALF/ZERO, konst, register values) share the stage constant */
-static int resolve(const In *in, int inv, int is_alpha, uint32_t *stage_const, int *const_used,
-                   GPU_TEVSRC *src, int *op)
+/* Constants an operation reads: each PICA stage has one constant color, and
+ * the combiner buffer starts out as a second one (until a stage updates the
+ * buffer). An operand only reads some bytes of it (rgb, alpha or one
+ * component), so two constants can share a color when those bytes agree. */
+typedef struct {
+    uint32_t val, mask;           /* stage constant and the bytes in use */
+    uint32_t *bval, *bmask;       /* buffer color, for the whole program */
+    int buf_ok;                   /* the buffer still holds its color */
+} Consts;
+
+static uint32_t operand_bytes(int is_alpha, int op)
+{
+    switch (op & ~1) {
+    case 0: return is_alpha ? 0xFF000000 : 0x00FFFFFF;     /* alpha / color */
+    case 2: return is_alpha ? 0x000000FF : 0xFF000000;     /* r / alpha */
+    case 4: return is_alpha ? 0x0000FF00 : 0x000000FF;     /* g / r */
+    case 6: return 0x00FF0000;                             /* alpha op: b */
+    case 8: return 0x0000FF00;                             /* rgb op: g */
+    default: return 0x00FF0000;                            /* rgb op: b */
+    }
+}
+
+static int fits(uint32_t *val, uint32_t *mask, uint32_t want, uint32_t bytes)
+{
+    if ((*val ^ want) & *mask & bytes)
+        return 0;
+    *val = (*val & ~bytes) | (want & bytes);
+    *mask |= bytes;
+    return 1;
+}
+
+/* resolves an In to a PICA source/operand */
+static void resolve(const In *in, int inv, int is_alpha, Consts *k, GPU_TEVSRC *src, int *op)
 {
     uint32_t want;
     int base_op = in->op;
@@ -673,35 +702,31 @@ static int resolve(const In *in, int inv, int is_alpha, uint32_t *stage_const, i
         if (in->src != GPU_CONSTANT) {
             *src = in->src;
             *op = base_op + (inv ? 1 : 0);
-            return 1;
+            return;
         }
         want = in->constant;
     }
-    if (!*const_used) {
-        *stage_const = want;
-        *const_used = 1;
-    } else if (*stage_const != want) {
-        /* conflict: keep the first constant (approximation) */
-    }
+    uint32_t bytes = operand_bytes(is_alpha, base_op);
     *src = GPU_CONSTANT;
+    if (!fits(&k->val, &k->mask, want, bytes) && k->buf_ok && fits(k->bval, k->bmask, want, bytes))
+        *src = GPU_PREVIOUS_BUFFER;
+    /* else: both colors taken, keep the stage constant (approximation) */
     *op = base_op + (inv ? 1 : 0);
-    (void)is_alpha;
-    return 1;
 }
 
-static void emit_op(C3D_TexEnv *env, const Op *op, int is_alpha, uint32_t *stage_const, int *const_used)
+static void emit_op(C3D_TexEnv *env, const Op *op, int is_alpha, Consts *k)
 {
     GPU_TEVSRC src[3] = {GPU_PREVIOUS, GPU_PREVIOUS, GPU_PREVIOUS};
     int ops[3] = {0, 0, 0};
-    for (int k = 0; k < 3; k++) {
-        if (op->prev_op[k]) {
-            src[k] = GPU_PREVIOUS;
-            ops[k] = 0;
+    for (int i = 0; i < 3; i++) {
+        if (op->prev_op[i]) {
+            src[i] = GPU_PREVIOUS;
+            ops[i] = 0;
             continue;
         }
-        if (op->s[k].kind == IN_ZERO && k > 0 && op->func == GPU_REPLACE)
+        if (op->s[i].kind == IN_ZERO && i > 0 && op->func == GPU_REPLACE)
             continue;
-        resolve(&op->s[k], op->inv[k], is_alpha, stage_const, const_used, &src[k], &ops[k]);
+        resolve(&op->s[i], op->inv[i], is_alpha, k, &src[i], &ops[i]);
     }
     C3D_TexEnvSrc(env, is_alpha ? C3D_Alpha : C3D_RGB, src[0], src[1], src[2]);
     if (is_alpha)
@@ -720,6 +745,7 @@ static void build_program(const DrawSetup *ds, Program *p)
         rs_rgb[i].pica_stage = rs_a[i].pica_stage = -1;
     memset(p, 0, sizeof *p);
     int buffered = -1;          /* PICA stage whose output the buffer holds */
+    uint32_t buf_bytes = 0;     /* bytes of the buffer color in use */
 
     for (int s = 0; s < nstages && p->n < 6; s++) {
         uint32_t tref = g_gx.bp[BP_TREF(s)] >> ((s & 1) * 12);
@@ -757,13 +783,12 @@ static void build_program(const DrawSetup *ds, Program *p)
         for (int k = 0; k < steps; k++) {
             C3D_TexEnv *env = &p->env[p->n];
             C3D_TexEnvInit(env);
-            uint32_t sc = 0;
-            int used = 0;
-            if (k < nc) emit_op(env, &cop[k], 0, &sc, &used);
+            Consts consts = {0, 0, &p->buf_color, &buf_bytes, !p->buf_mask_rgb && !p->buf_mask_a};
+            if (k < nc) emit_op(env, &cop[k], 0, &consts);
             else { C3D_TexEnvSrc(env, C3D_RGB, GPU_PREVIOUS, 0, 0); C3D_TexEnvFunc(env, C3D_RGB, GPU_REPLACE); }
-            if (k < na) emit_op(env, &aop[k], 1, &sc, &used);
+            if (k < na) emit_op(env, &aop[k], 1, &consts);
             else { C3D_TexEnvSrc(env, C3D_Alpha, GPU_PREVIOUS, 0, 0); C3D_TexEnvFunc(env, C3D_Alpha, GPU_REPLACE); }
-            C3D_TexEnvColor(env, sc);
+            C3D_TexEnvColor(env, consts.val);
             if (k == steps - 1) {
                 static const GPU_TEVSCALE sc_map[4] = {GPU_TEVSCALE_1, GPU_TEVSCALE_2, GPU_TEVSCALE_4, GPU_TEVSCALE_1};
                 C3D_TexEnvScale(env, C3D_RGB, sc_map[BITS(cenv, 20, 2)]);
@@ -842,6 +867,7 @@ static void apply_program(const Program *p)
     }
     C3D_TexEnvBufUpdate(C3D_RGB, p->buf_mask_rgb);
     C3D_TexEnvBufUpdate(C3D_Alpha, p->buf_mask_a);
+    C3D_TexEnvBufColor(p->buf_color);
 }
 
 /* ---------------------------------------------------------------- draws */
