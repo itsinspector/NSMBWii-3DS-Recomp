@@ -226,6 +226,17 @@ static int di_ioctl(uint32_t cmd, uint32_t in, uint32_t in_len, uint32_t out, ui
         if (out && out_len >= 4)
             st32(out, 0);
         return 1;
+    case 0xDA:                      /* ReadBCA: the burst cutting area of a pressed disc */
+        /* NSMBW checks it once at boot: bytes 0-0x32 zero, then a 1. If not,
+         * it schedules the fatal "An error has occurred" screen 3-10 minutes
+         * later (and the game seems to freeze at a random point). */
+        if (out && out_len) {
+            uint32_t n = out_len < 0x40 ? out_len : 0x40;
+            memset(guest_ptr(out), 0, n);
+            if (n > 0x33)
+                st8(out + 0x33, 1);
+        }
+        return 1;
     case 0x88:                      /* GetCoverStatus: disc present */
         if (out && out_len >= 4)
             st32(out, 2);
@@ -493,8 +504,51 @@ static int es_ioctlv(uint32_t cmd, int nin, int nout, uint32_t vec)
 
 /* ------------------------------------------------------------- dispatch */
 
+/* the last IOS requests, for OSFatal reports: device, command, result,
+ * real duration, guest time */
+typedef struct { int type, v; uint32_t cmd; int ret; uint32_t real_us, guest_ms; } IosRec;
+static IosRec s_ios_ring[32];
+static uint32_t s_ios_pos;
+
+static void ios_note(int type, int v, uint32_t cmd, int ret, uint64_t t0)
+{
+    IosRec *r = &s_ios_ring[s_ios_pos++ & 31];
+    r->type = type;
+    r->v = v;
+    r->cmd = cmd;
+    r->ret = ret;
+    r->real_us = (uint32_t)(plat_time_us() - t0);
+    r->guest_ms = (uint32_t)(rt_time_us() / 1000);
+}
+
+void ios_dump_recent(void)
+{
+    static const char *const dev[] = {"-", "di", "fs", "es", "stm", "stm-event", "file", "dummy"};
+    rt_log("last IOS requests (guest time now %lu ms):", (unsigned long)(rt_time_us() / 1000));
+    for (uint32_t k = 32; k > 0; k--) {
+        const IosRec *r = &s_ios_ring[(s_ios_pos - k) & 31];
+        if (!r->guest_ms)
+            continue;
+        rt_log("  %s %s %02lX -> %d, %lu us, at %lu ms", r->type < 8 ? dev[r->type] : "?", r->v ? "ioctlv" : "ioctl",
+               (unsigned long)r->cmd, r->ret, (unsigned long)r->real_us, (unsigned long)r->guest_ms);
+    }
+}
+
+static int do_ioctl_(int fd, uint32_t cmd, uint32_t in, uint32_t in_len, uint32_t out, uint32_t out_len,
+                     int *never_completes);
+
 static int do_ioctl(int fd, uint32_t cmd, uint32_t in, uint32_t in_len, uint32_t out, uint32_t out_len,
                     int *never_completes)
+{
+    uint64_t t0 = plat_time_us();
+    int ret = do_ioctl_(fd, cmd, in, in_len, out, out_len, never_completes);
+    Fd *d = get_fd(fd);
+    ios_note(d ? d->type : 0, 0, cmd, ret, t0);
+    return ret;
+}
+
+static int do_ioctl_(int fd, uint32_t cmd, uint32_t in, uint32_t in_len, uint32_t out, uint32_t out_len,
+                     int *never_completes)
 {
     Fd *d = get_fd(fd);
     if (!d)
@@ -511,7 +565,18 @@ static int do_ioctl(int fd, uint32_t cmd, uint32_t in, uint32_t in_len, uint32_t
     }
 }
 
+static int do_ioctlv_(int fd, uint32_t cmd, int nin, int nout, uint32_t vec);
+
 static int do_ioctlv(int fd, uint32_t cmd, int nin, int nout, uint32_t vec)
+{
+    uint64_t t0 = plat_time_us();
+    int ret = do_ioctlv_(fd, cmd, nin, nout, vec);
+    Fd *d = get_fd(fd);
+    ios_note(d ? d->type : 0, 1, cmd, ret, t0);
+    return ret;
+}
+
+static int do_ioctlv_(int fd, uint32_t cmd, int nin, int nout, uint32_t vec)
 {
     Fd *d = get_fd(fd);
     if (!d)

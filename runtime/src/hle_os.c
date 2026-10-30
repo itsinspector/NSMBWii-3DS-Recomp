@@ -127,6 +127,33 @@ void rt_guest_threads_dump(void)
     }
 }
 
+/* OSFatal(GXColor fg, GXColor bg, const char *msg): the game gave up. The
+ * SDK would draw msg and spin with interrupts off; log it and the guest call
+ * stacks instead */
+void hle_OSFatal(PPCContext *c)
+{
+    char msg[256];
+    uint32_t i = 0, off;
+    for (; i + 1 < sizeof msg && c->r[5]; i++) {
+        msg[i] = (char)ld8(c->r[5] + i);
+        if (!msg[i])
+            break;
+    }
+    msg[i] = 0;
+    rt_log("OSFatal called from %08lX %s: %s", (unsigned long)c->lr, symbol_name(c->lr, &off), msg);
+    extern void ios_dump_recent(void);
+    ios_dump_recent();
+#ifdef RT_TRACE_RING
+    rt_log("last guest functions entered:");
+    for (uint32_t k = 96; k > 0; k--) {
+        uint32_t a = g_trace_ring[(g_trace_pos - k) & 1023];
+        rt_log("  %08lX %s", (unsigned long)a, symbol_name(a, &off));
+    }
+#endif
+    rt_guest_threads_dump();
+    rt_fatal("the game called OSFatal");
+}
+
 void rt_fatal(const char *fmt, ...)
 {
     char buf[512];
@@ -719,6 +746,14 @@ static void check_interrupts(PPCContext *c)
     g_rt_pending = 0;
     hw_update();
     int delivered = 0;
+    /* IOS replies first: requests complete when they are made (disc reads
+     * are synchronous), before any timer that ran out during a slow read.
+     * Otherwise the DVD library's timeout alarm can fire ahead of the reply
+     * and it shows its fatal "An error has occurred" screen. */
+    if (s_cbq_head != s_cbq_tail) {
+        run_callbacks(c);
+        delivered = 1;
+    }
     if (s_dec_armed && (int64_t)(rt_ticks() - s_dec_deadline) >= 0) {
         s_dec_armed = 0;
         dispatch_exception(c, EXC_DECREMENTER);
@@ -726,10 +761,6 @@ static void check_interrupts(PPCContext *c)
     }
     for (int n = 0; n < 8 && hw_external_pending(); n++) {
         dispatch_exception(c, EXC_EXTERNAL);
-        delivered = 1;
-    }
-    if (s_cbq_head != s_cbq_tail) {
-        run_callbacks(c);
         delivered = 1;
     }
     if (delivered)

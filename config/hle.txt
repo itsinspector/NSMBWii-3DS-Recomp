@@ -14,6 +14,7 @@ ConfigMEM2_56MB      hle_nop
 ConfigMEM2_64MB      hle_nop
 ConfigMEM2_112MB     hle_nop
 RealMode             hle_RealMode
+_Z7OSFatal7GXColorS_PKc  hle_OSFatal   # log why the game gave up, then stop
 
 # --- IOS client API (runtime/src/hle_ios.c)
 IOS_OpenAsync        hle_IOS_OpenAsync
