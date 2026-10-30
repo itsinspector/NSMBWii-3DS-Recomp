@@ -12,10 +12,12 @@
 #include <3ds.h>
 #include <citro3d.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include "runtime.h"
 #include "gx_state.h"
 #include "vshader_shbin.h"
+#include "vshader_tl_shbin.h"
 
 #define EFB_W 640
 #define EFB_H 528
@@ -30,9 +32,34 @@ typedef struct {
     float tc[3][2];
 } CVert;
 
-static DVLB_s *s_dvlb;
-static shaderProgram_s s_prog;
-static C3D_AttrInfo s_attr;
+static DVLB_s *s_dvlb, *s_dvlb_tl;
+static shaderProgram_s s_prog, s_prog_tl;
+static C3D_AttrInfo s_attr, s_attr_tl;
+static int s_cur_prog;            /* 0 passthrough, 1 GPU transform */
+static uint32_t s_tl_count[5];    /* draws per path, logged every 120 frames */
+
+/* GPU transform: vertex layout and uniform locations (vshader_tl.v.pica) */
+typedef struct {
+    float pos[3];
+    u8 col[4];
+    float mtx;                    /* position matrix row */
+    float src[3][3];              /* texgen source per unit */
+} TLVert;
+
+static struct {
+    int mtx, tm, post, proj, tcs, b_proj, b_dual, b_norm;
+    float shadow[66][4];          /* matrix rows the GPU holds */
+    uint8_t valid[66];
+} s_tl;
+
+static void use_program(int tl)
+{
+    if (s_cur_prog == tl)
+        return;
+    s_cur_prog = tl;
+    C3D_BindProgram(tl ? &s_prog_tl : &s_prog);
+    C3D_SetAttrInfo(tl ? &s_attr_tl : &s_attr);
+}
 static C3D_Tex s_efb_tex;
 static C3D_RenderTarget *s_efb_rt, *s_screen;
 static CVert *s_vbuf;
@@ -54,6 +81,7 @@ typedef struct {
     uint32_t addr, fmt;    /* guest address and GX format of a decoded texture */
     uint16_t gw, gh;       /* its GX size (w, h can be half of it) */
     uint32_t last_use;
+    uint32_t read_frame;   /* last frame the CPU fetched it (see cpu_view) */
     int used;
     int next;              /* hash chain, -1 end */
 } GpuTex;
@@ -255,6 +283,14 @@ static GpuTex *gpu_texture(int unit)
 
 /* ---------------------------------------------------------------- frame */
 
+/* GPU-rendered pixels the CPU reads: emulators keep render targets on the
+ * host GPU and write them back on a cache invalidate, the console needs it
+ * for linear memory */
+static void cpu_view(void *data, uint32_t size)
+{
+    GSPGPU_InvalidateDataCache(data, size);
+}
+
 static void begin_frame(void)
 {
     if (s_in_frame)
@@ -262,6 +298,7 @@ static void begin_frame(void)
     PROF_BEGIN(w);
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
     PROF_END(w, PROF_GPUWAIT);
+
     C3D_FrameDrawOn(s_efb_rt);
     s_vpos = 0;
     s_ipos = 0;
@@ -299,6 +336,7 @@ static CVert *alloc_verts(uint32_t n)
 
 static void draw_verts(CVert *v, uint32_t n)
 {
+    use_program(0);
     C3D_BufInfo *bi = C3D_GetBufInfo();
     BufInfo_Init(bi);
     BufInfo_Add(bi, v, sizeof(CVert), 5, 0x43210);
@@ -320,6 +358,26 @@ void gfx_init(void)
     AttrInfo_AddLoader(&s_attr, 3, GPU_FLOAT, 2);   /* tc1 */
     AttrInfo_AddLoader(&s_attr, 4, GPU_FLOAT, 2);   /* tc2 */
     C3D_SetAttrInfo(&s_attr);
+
+    s_dvlb_tl = DVLB_ParseFile((u32 *)vshader_tl_shbin, vshader_tl_shbin_size);
+    shaderProgramInit(&s_prog_tl);
+    shaderProgramSetVsh(&s_prog_tl, &s_dvlb_tl->DVLE[0]);
+    AttrInfo_Init(&s_attr_tl);
+    AttrInfo_AddLoader(&s_attr_tl, 0, GPU_FLOAT, 3);          /* position */
+    AttrInfo_AddLoader(&s_attr_tl, 1, GPU_UNSIGNED_BYTE, 4);  /* color */
+    AttrInfo_AddLoader(&s_attr_tl, 2, GPU_FLOAT, 1);          /* matrix row */
+    AttrInfo_AddLoader(&s_attr_tl, 3, GPU_FLOAT, 3);          /* texgen sources */
+    AttrInfo_AddLoader(&s_attr_tl, 4, GPU_FLOAT, 3);
+    AttrInfo_AddLoader(&s_attr_tl, 5, GPU_FLOAT, 3);
+    shaderInstance_s *vs = s_prog_tl.vertexShader;
+    s_tl.mtx = shaderInstanceGetUniformLocation(vs, "mtx");
+    s_tl.tm = shaderInstanceGetUniformLocation(vs, "tm");
+    s_tl.post = shaderInstanceGetUniformLocation(vs, "post");
+    s_tl.proj = shaderInstanceGetUniformLocation(vs, "proj");
+    s_tl.tcs = shaderInstanceGetUniformLocation(vs, "tcs");
+    s_tl.b_proj = shaderInstanceGetUniformLocation(vs, "proj0");
+    s_tl.b_dual = shaderInstanceGetUniformLocation(vs, "dual0");
+    s_tl.b_norm = shaderInstanceGetUniformLocation(vs, "norm0");
 
     rt_log("gfx: linear memory free %lu KiB before buffers", (unsigned long)(linearSpaceFree() >> 10));
     s_vbuf = linearAlloc(sizeof(CVert) * VBUF_VERTS);
@@ -427,11 +485,30 @@ typedef struct {
     int pica_stage;   /* stage whose output holds the value, -1: initial (BP) */
 } RegState;
 
+/* GX indirect texturing, done per vertex: the PICA has no dependent texture
+ * reads. Only for stages whose coordinate comes entirely from the indirect
+ * lookup (models light themselves by looking up a light ramp through the
+ * light texture, indexed by the normal): interpolating that coordinate
+ * across the triangle is close; distortions keep the plain coordinate. */
+typedef struct {
+    int on;
+    int icoord, ss_s, ss_t, bias;
+    int m[2][3], shift;          /* matrix rows and (17 - scale) */
+    float inv_w, inv_h;          /* 1 / (stage texture size * 128) */
+    int gw, gh;                  /* indirect texture size */
+    const uint32_t *tiled;       /* EFB copy: PICA tiled RGBA8, bottom-up */
+    int tw, th;                  /* its power-of-two size */
+    const uint32_t *rgba;        /* decoded texture: linear RGBA */
+    int dw, dh;                  /* its (maybe halved) size */
+} IndUnit;
+
 typedef struct {
     int unit[8];          /* texmap -> PICA unit (-1 none) */
     int unit_coord[3];    /* PICA unit -> GX texcoord */
     int unit_flip[3];     /* uploaded texture: the PICA samples rows bottom-up */
     int unit_map[3];
+    int unit_stage[3];    /* first TEV stage that samples the unit */
+    IndUnit ind[3];
     int nunits;
     int chan;             /* rasterized color channel passed as primary color */
 } DrawSetup;
@@ -872,6 +949,105 @@ static void apply_program(const Program *p)
 
 /* ---------------------------------------------------------------- draws */
 
+static void setup_indirect(IndUnit *iu, int stage, int map)
+{
+    uint32_t gen = g_gx.bp[BP_GENMODE];
+    int nind = (int)BITS(gen, 16, 3), ngen = (int)BITS(gen, 0, 4);
+    uint32_t ic = g_gx.bp[0x10 + stage];
+    uint32_t bt = BITS(ic, 0, 2), ifmt = BITS(ic, 2, 2), mid = BITS(ic, 9, 4);
+    uint32_t sw = BITS(ic, 13, 3), tw = BITS(ic, 16, 3), add = BITS(ic, 20, 1);
+    iu->on = 0;
+    if ((int)bt >= nind || ifmt || mid < 1 || mid > 3 || sw < 6 || tw < 6 || add)
+        return;
+    uint32_t iref = g_gx.bp[0x27];
+    int imap = (int)BITS(iref, bt * 6, 3), icoord = (int)BITS(iref, bt * 6 + 3, 3);
+    if (icoord >= ngen)
+        return;
+    uint32_t img0 = g_gx.bp[BP_TX_IMAGE0(imap)];
+    uint32_t addr = (g_gx.bp[BP_TX_IMAGE3(imap)] & 0xFFFFFF) << 5;
+    int w = (int)BITS(img0, 0, 10) + 1, h = (int)BITS(img0, 10, 10) + 1;
+    iu->tiled = NULL;
+    iu->rgba = NULL;
+    GpuTex *g = find_efb_copy(addr, w, h);
+    if (g) {
+        /* rendered by the GPU: read last frame's pixels */
+        if (g->read_frame != s_frame + 1) {
+            g->read_frame = s_frame + 1;
+            cpu_view(g->tex.data, g->tex.size);
+        }
+        iu->tiled = (const uint32_t *)g->tex.data;
+        iu->tw = g->tex.width;
+        iu->th = g->tex.height;
+    } else {
+        const GXTexture *t = gx_get_texture(imap);
+        if (!t)
+            return;
+        iu->rgba = t->rgba;
+        iu->dw = t->width;
+        iu->dh = t->height;
+    }
+    iu->gw = w;
+    iu->gh = h;
+    iu->icoord = icoord;
+    uint32_t ss = g_gx.bp[0x25 + bt / 2] >> ((bt & 1) * 8);
+    iu->ss_s = (int)BITS(ss, 0, 4);
+    iu->ss_t = (int)BITS(ss, 4, 4);
+    iu->bias = (int)BITS(ic, 4, 3);
+    uint32_t r[3];
+    for (int i = 0; i < 3; i++)
+        r[i] = g_gx.bp[0x06 + (mid - 1) * 3 + i];
+    for (int i = 0; i < 3; i++) {
+        iu->m[0][i] = (int32_t)(r[i] << 21) >> 21;
+        iu->m[1][i] = (int32_t)((r[i] >> 11) << 21) >> 21;
+    }
+    iu->shift = 17 - (int)(BITS(r[0], 22, 2) | BITS(r[1], 22, 2) << 2 | BITS(r[2], 22, 2) << 4);
+    uint32_t simg = g_gx.bp[BP_TX_IMAGE0(map)];
+    iu->inv_w = 1.0f / ((BITS(simg, 0, 10) + 1) * 128.0f);
+    iu->inv_h = 1.0f / ((BITS(simg, 10, 10) + 1) * 128.0f);
+    iu->on = 1;
+}
+
+/* indirect texel (x, y) in guest texels, as the (a, b, g) the TEV reads */
+static void ind_texel(const IndUnit *iu, int x, int y, float out[3])
+{
+    x = x < 0 ? 0 : x >= iu->gw ? iu->gw - 1 : x;
+    y = y < 0 ? 0 : y >= iu->gh ? iu->gh - 1 : y;
+    if (iu->tiled) {
+        int my = iu->th - 1 - y;
+        uint32_t c = iu->tiled[((uint32_t)(my >> 3) * (iu->tw >> 3) + (x >> 3)) * 64 + morton8(x & 7, my & 7)];
+        out[0] = (float)(c & 255);            /* A, B, G: ABGR in memory */
+        out[1] = (float)((c >> 8) & 255);
+        out[2] = (float)((c >> 16) & 255);
+    } else {
+        const uint8_t *p = (const uint8_t *)&iu->rgba[(y * iu->dh / iu->gh) * iu->dw + x * iu->dw / iu->gw];
+        out[0] = p[3];
+        out[1] = p[2];
+        out[2] = p[1];
+    }
+}
+
+/* the stage's texture coordinate (normalized) from the indirect lookup */
+static void ind_coord(const IndUnit *iu, const float *tc, float *s, float *t)
+{
+    float q = tc[2] != 0 ? tc[2] : 1.0f;
+    float x = tc[0] / q / (float)(1 << iu->ss_s) * iu->gw - 0.5f;
+    float y = tc[1] / q / (float)(1 << iu->ss_t) * iu->gh - 0.5f;
+    int x0 = (int)floorf(x), y0 = (int)floorf(y);
+    float fx = x - x0, fy = y - y0, a[3], b[3], c[3], d[3], ic[3];
+    ind_texel(iu, x0, y0, a);
+    ind_texel(iu, x0 + 1, y0, b);
+    ind_texel(iu, x0, y0 + 1, c);
+    ind_texel(iu, x0 + 1, y0 + 1, d);
+    for (int k = 0; k < 3; k++) {
+        ic[k] = (a[k] * (1 - fx) + b[k] * fx) * (1 - fy) + (c[k] * (1 - fx) + d[k] * fx) * fy;
+        if (iu->bias & (1 << k))
+            ic[k] -= 128.0f;
+    }
+    float k = 1.0f / 8.0f * ldexpf(1.0f, -iu->shift);
+    *s = (iu->m[0][0] * ic[0] + iu->m[0][1] * ic[1] + iu->m[0][2] * ic[2]) * k * iu->inv_w;
+    *t = (iu->m[1][0] * ic[0] + iu->m[1][1] * ic[1] + iu->m[1][2] * ic[2]) * k * iu->inv_h;
+}
+
 static void setup_textures(DrawSetup *ds, float scale[3][2])
 {
     uint32_t gen = g_gx.bp[BP_GENMODE];
@@ -890,14 +1066,18 @@ static void setup_textures(DrawSetup *ds, float scale[3][2])
         ds->unit[map] = ds->nunits;
         ds->unit_map[ds->nunits] = (int)map;
         ds->unit_coord[ds->nunits] = (int)coord;
+        ds->unit_stage[ds->nunits] = s;
         ds->nunits++;
     }
     ds->chan = use_chan[1] && !use_chan[0] ? 1 : 0;
     for (int u = 0; u < 3; u++) {
         scale[u][0] = scale[u][1] = 1.0f;
         ds->unit_flip[u] = 0;
+        ds->ind[u].on = 0;
         if (u >= ds->nunits)
             continue;
+        if (BITS(gen, 16, 3))
+            setup_indirect(&ds->ind[u], ds->unit_stage[u], ds->unit_map[u]);
         int map = ds->unit_map[u];
         GpuTex *g = gpu_texture(map);
         if (!g) {
@@ -947,10 +1127,17 @@ static void to_rt(const GXVertex *v, const DrawSetup *ds, const float scale[3][2
     memcpy(o->col, v->color[ds->chan], sizeof o->col);
     for (int u = 0; u < 3; u++) {
         if (u < ds->nunits) {
-            const float *t = v->tex[ds->unit_coord[u]];
-            float q = t[2] != 0 ? t[2] : 1.0f;
-            o->tc[u][0] = t[0] / q * scale[u][0];
-            o->tc[u][1] = t[1] / q * scale[u][1];
+            float s, tt;
+            if (ds->ind[u].on) {
+                ind_coord(&ds->ind[u], v->tex[ds->ind[u].icoord], &s, &tt);
+            } else {
+                const float *t = v->tex[ds->unit_coord[u]];
+                float q = t[2] != 0 ? t[2] : 1.0f;
+                s = t[0] / q;
+                tt = t[1] / q;
+            }
+            o->tc[u][0] = s * scale[u][0];
+            o->tc[u][1] = tt * scale[u][1];
             if (ds->unit_flip[u])
                 o->tc[u][1] = 1.0f - o->tc[u][1];
         } else {
@@ -1000,11 +1187,217 @@ void gfx_draw_indexed(const GXVertex *v, uint32_t nverts, const uint32_t *idx, u
     apply_program(cached_program(&ds));
     apply_fragment_ops();
     set_scissor();
+    use_program(0);
     C3D_BufInfo *bi = C3D_GetBufInfo();
     BufInfo_Init(bi);
     BufInfo_Add(bi, out, sizeof(CVert), 5, 0x43210);
     C3D_DrawElements(GPU_TRIANGLES, (int)nidx, C3D_UNSIGNED_SHORT, ind);
 }
+
+/* ------------------------------------------------------- GPU transform */
+
+static void unif4(int loc, const float *f) { C3D_FVUnifSet(GPU_VERTEX_SHADER, loc, f[0], f[1], f[2], f[3]); }
+
+static void unpack_color(uint32_t c, float *out)
+{
+    out[0] = (c >> 24) / 255.0f;
+    out[1] = ((c >> 16) & 255) / 255.0f;
+    out[2] = ((c >> 8) & 255) / 255.0f;
+    out[3] = (c & 255) / 255.0f;
+}
+
+static u8 to_u8(float f) { return (u8)(f <= 0 ? 0 : f >= 1 ? 255 : f * 255.0f + 0.5f); }
+
+/* eye space -> render target clip space: the GX projection, then the
+ * viewport mapping to_rt applies (rt_map) */
+static void tl_projection(void)
+{
+    RtMap m;
+    rt_map(&m);
+    float P[6];
+    for (int i = 0; i < 6; i++)
+        P[i] = gx_xf_float(g_gx.xf_regs[XF_PROJECTION + i]);
+    float r[4][4] = {{0}};
+    if (g_gx.xf_regs[XF_PROJECTION + 6] == 0) {      /* perspective: w = -z */
+        r[0][0] = P[0] * m.ax; r[0][2] = P[1] * m.ax - m.bx;
+        r[1][1] = P[2] * m.ay; r[1][2] = P[3] * m.ay - m.by;
+        r[2][2] = P[4] * m.az - m.bz; r[2][3] = P[5] * m.az;
+        r[3][2] = -1.0f;
+    } else {
+        r[0][0] = P[0] * m.ax; r[0][3] = P[1] * m.ax + m.bx;
+        r[1][1] = P[2] * m.ay; r[1][3] = P[3] * m.ay + m.by;
+        r[2][2] = P[4] * m.az; r[2][3] = P[5] * m.az + m.bz;
+        r[3][3] = 1.0f;
+    }
+    for (int i = 0; i < 4; i++)
+        unif4(s_tl.proj + i, r[i]);
+}
+
+/* matrix memory rows a position matrix uses, uploaded when they changed */
+static void tl_matrix_rows(uint32_t row)
+{
+    for (uint32_t r = row; r < row + 3 && r < 66; r++) {
+        const float *f = &g_gx.xf_memf[r * 4];
+        if (s_tl.valid[r] && !memcmp(s_tl.shadow[r], f, 16))
+            continue;
+        memcpy(s_tl.shadow[r], f, 16);
+        s_tl.valid[r] = 1;
+        unif4(s_tl.mtx + (int)r, f);
+    }
+}
+
+int gfx_draw_raw(const GXRawVertex *v, uint32_t nverts, const uint32_t *idx, uint32_t nidx, int texmtx_direct)
+{
+    static int cpu_tl = -1;       /* debug: sdmc:/3ds/nsmbw/cpu_tl keeps the transform on the CPU */
+    if (cpu_tl < 0) {
+        FILE *f = fopen("sdmc:/3ds/nsmbw/cpu_tl", "rb");
+        cpu_tl = f != NULL;
+        if (f)
+            fclose(f);
+    }
+    if (cpu_tl || texmtx_direct || !nidx || nverts > 0xFFFF) {
+        s_tl_count[cpu_tl ? 4 : 3]++;
+        return 0;
+    }
+    uint32_t nchan = g_gx.xf_regs[XF_NUM_COLORS] & 3, ngen = g_gx.xf_regs[XF_NUM_TEXGENS] & 15;
+    int dual = g_gx.xf_regs[XF_DUALTEX] & 1;
+    DrawSetup ds;
+    float scale[3][2];
+    setup_textures(&ds, scale);
+    /* lit colors stay on the CPU */
+    int chan = ds.chan;
+    uint32_t ccr = g_gx.xf_regs[XF_COLOR0_CNTRL + chan], cca = g_gx.xf_regs[XF_ALPHA0_CNTRL + chan];
+    if ((uint32_t)chan < nchan && ((ccr | cca) & 2)) {
+        s_tl_count[1]++;
+        return 0;
+    }
+    /* per unit: 0 constant (0, 0), 1 texgen on the GPU, 2 coordinate from the CPU */
+    int mode[3] = {0, 0, 0};
+    uint32_t gen[3] = {0, 0, 0};
+    for (int u = 0; u < ds.nunits; u++) {
+        int c = ds.unit_coord[u];
+        if (ds.ind[u].on) {
+            if (BITS(g_gx.xf_regs[XF_TEXGEN0 + ds.ind[u].icoord], 4, 3)) {
+                s_tl_count[2]++;
+                return 0;
+            }
+            mode[u] = 2;
+        } else if ((uint32_t)c < ngen) {
+            gen[u] = g_gx.xf_regs[XF_TEXGEN0 + c];
+            if (BITS(gen[u], 4, 3)) {               /* emboss and color texgens */
+                s_tl_count[2]++;
+                return 0;
+            }
+            mode[u] = 1;
+        }
+    }
+
+    begin_frame();
+    uint32_t slots = (uint32_t)((nverts * sizeof(TLVert) + sizeof(CVert) - 1) / sizeof(CVert));
+    ensure_space(slots, nidx);
+    if (s_vpos + slots > VBUF_VERTS || s_ipos + nidx > IBUF_INDICES)
+        return 1;
+    TLVert *out = (TLVert *)&s_vbuf[s_vpos];
+    u16 *ind = &s_ibuf[s_ipos];
+    s_vpos += slots;
+    s_ipos += nidx;
+
+    /* uniforms */
+    tl_projection();
+    static const float id[2][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}};
+    for (int u = 0; u < 3; u++) {
+        int proj = 0, dl = 0, nrm = 0;
+        if (mode[u] == 1) {
+            uint32_t m = v[0].texmtx[ds.unit_coord[u]] * 4;
+            for (int r = 0; r < 3; r++)
+                unif4(s_tl.tm + u * 3 + r, &g_gx.xf_memf[(m + r * 4) & 0xFFF]);
+            proj = (int)BITS(gen[u], 1, 1);
+            if (dual) {
+                uint32_t post = g_gx.xf_regs[XF_POSTMTX0 + ds.unit_coord[u]];
+                dl = 1;
+                nrm = (int)BITS(post, 8, 1);
+                for (int r = 0; r < 3; r++)
+                    unif4(s_tl.post + u * 3 + r, &g_gx.xf_memf[0x500 + BITS(post, 0, 6) * 4 + r * 4]);
+            }
+        } else {
+            unif4(s_tl.tm + u * 3, id[0]);
+            unif4(s_tl.tm + u * 3 + 1, id[1]);
+        }
+        C3D_BoolUnifSet(GPU_VERTEX_SHADER, s_tl.b_proj + u, proj);
+        C3D_BoolUnifSet(GPU_VERTEX_SHADER, s_tl.b_dual + u, dl);
+        C3D_BoolUnifSet(GPU_VERTEX_SHADER, s_tl.b_norm + u, nrm);
+        int flip = u < ds.nunits && ds.unit_flip[u];
+        float t[4] = {scale[u][0], flip ? -scale[u][1] : scale[u][1], flip ? 1.0f : 0.0f, 0};
+        unif4(s_tl.tcs + u, t);
+    }
+
+    /* colors: material register or vertex color (unlit) */
+    float mat[4];
+    unpack_color(g_gx.xf_regs[XF_MATERIAL0 + chan], mat);
+    int crgb = (uint32_t)chan < nchan, vrgb = ccr & 1, va = cca & 1;
+    u8 mcol[4] = {to_u8(mat[0]), to_u8(mat[1]), to_u8(mat[2]), to_u8(mat[3])};
+
+    uint64_t rows = 0;
+    for (uint32_t i = 0; i < nverts; i++) {
+        const GXRawVertex *in = &v[i];
+        TLVert *o = &out[i];
+        memcpy(o->pos, in->pos, sizeof o->pos);
+        if (!crgb) {
+            o->col[0] = o->col[1] = o->col[2] = o->col[3] = 0;
+        } else {
+            const float *vc = in->col[chan];
+            if (vrgb) { o->col[0] = to_u8(vc[0]); o->col[1] = to_u8(vc[1]); o->col[2] = to_u8(vc[2]); }
+            else { o->col[0] = mcol[0]; o->col[1] = mcol[1]; o->col[2] = mcol[2]; }
+            o->col[3] = va ? to_u8(vc[3]) : mcol[3];
+        }
+        o->mtx = (float)in->pnmtx;
+        rows |= 1ull << in->pnmtx;
+        for (int u = 0; u < 3; u++) {
+            float *s = o->src[u];
+            if (mode[u] == 1) {
+                uint32_t g = gen[u], row = BITS(g, 7, 5);
+                s[2] = 1.0f;
+                switch (row) {
+                case 0: memcpy(s, in->pos, 12); break;
+                case 1: memcpy(s, in->nrm[0], 12); break;
+                case 2: memcpy(s, in->col[0], 12); break;
+                case 3: memcpy(s, in->nrm[1], 12); break;
+                case 4: memcpy(s, in->nrm[2], 12); break;
+                default:
+                    if (row >= 5 && row <= 12) { s[0] = in->tex[row - 5][0]; s[1] = in->tex[row - 5][1]; }
+                    else s[0] = s[1] = 0;
+                }
+                if (!BITS(g, 2, 1))
+                    s[2] = 1.0f;
+            } else if (mode[u] == 2) {
+                float tc[3];
+                gx_texgen(in, ds.ind[u].icoord, tc);
+                ind_coord(&ds.ind[u], tc, &s[0], &s[1]);
+                s[2] = 1.0f;
+            } else {
+                s[0] = s[1] = 0;
+                s[2] = 1.0f;
+            }
+        }
+    }
+    for (uint32_t r = 0; r < 64; r++)
+        if (rows >> r & 1)
+            tl_matrix_rows(r);
+    for (uint32_t i = 0; i < nidx; i++)
+        ind[i] = (u16)idx[i];
+
+    apply_program(cached_program(&ds));
+    apply_fragment_ops();
+    set_scissor();
+    use_program(1);
+    C3D_BufInfo *bi = C3D_GetBufInfo();
+    BufInfo_Init(bi);
+    BufInfo_Add(bi, out, sizeof(TLVert), 6, 0x543210);
+    C3D_DrawElements(GPU_TRIANGLES, (int)nidx, C3D_UNSIGNED_SHORT, ind);
+    s_tl_count[0]++;
+    return 1;
+}
+
 
 void gfx_draw_triangles(const GXVertex *v, uint32_t count)
 {
@@ -1229,6 +1622,12 @@ void gfx_present(void)
     C3D_FrameEnd(0);
     s_in_frame = 0;
     s_frame++;
+    if (s_frame % 120 == 0) {
+        rt_log("[tl] draws: %lu on the GPU, CPU: %lu lit, %lu color/emboss texgen, %lu texmtx per vertex, %lu forced",
+               (unsigned long)s_tl_count[0], (unsigned long)s_tl_count[1], (unsigned long)s_tl_count[2],
+               (unsigned long)s_tl_count[3], (unsigned long)s_tl_count[4]);
+        memset(s_tl_count, 0, sizeof s_tl_count);
+    }
     rt_prof_frame();
     free_retired(0);
     gx_texture_frame();

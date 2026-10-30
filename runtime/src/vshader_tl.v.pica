@@ -1,0 +1,132 @@
+; GX transform on the GPU (gfx_c3d.c, gfx_draw_raw): position matrix per
+; vertex (matrix memory mirrored in mtx), projection folded with the viewport
+; into proj, and texture coordinate generation for the three PICA units.
+; The CPU reads the vertices, works out unlit colors and picks each unit's
+; texgen source, so the shader only does matrix math.
+
+.fvec mtx[66]       ; XF matrix memory rows 0..65
+.fvec tm[9]         ; texture matrix of unit u: rows 3u..3u+2
+.fvec post[9]       ; dual texgen post matrix of unit u
+.fvec proj[4]       ; eye space -> render target clip space
+.fvec tcs[3]        ; unit u: (s scale, t scale, t offset, 0)
+
+.bool proj0, proj1, proj2   ; texgen q from the matrix (else 1)
+.bool dual0, dual1, dual2   ; apply the post matrix
+.bool norm0, norm1, norm2   ; normalize before the post matrix
+
+.constf consts(1.0, 0.0, 0.0039215686, 0.0)
+.alias  ones  consts.xxxx
+.alias  inv255 consts.zzzz
+
+.out outpos position
+.out outclr color
+.out outtc0 texcoord0
+.out outtc1 texcoord1
+.out outtc2 texcoord2
+
+.alias inpos  v0    ; model space position
+.alias inclr  v1    ; color, 0..255
+.alias inidx  v2    ; position matrix row
+.alias insrc0 v3    ; texgen sources
+.alias insrc1 v4
+.alias insrc2 v5
+
+.proc main
+	; eye space position
+	mov r1.xyz, inpos
+	mov r1.w, ones
+	mova a0.x, inidx.x
+	dp4 r0.x, mtx[a0.x], r1
+	dp4 r0.y, mtx[a0.x+1], r1
+	dp4 r0.z, mtx[a0.x+2], r1
+	mov r0.w, ones
+	dp4 outpos.x, proj[0], r0
+	dp4 outpos.y, proj[1], r0
+	dp4 outpos.z, proj[2], r0
+	dp4 outpos.w, proj[3], r0
+
+	mul outclr, inv255, inclr
+
+	; unit 0
+	mov r1.xyz, insrc0
+	mov r1.w, ones
+	dp4 r2.x, tm[0], r1
+	dp4 r2.y, tm[1], r1
+	mov r2.z, ones
+	ifu proj0
+		dp4 r2.z, tm[2], r1
+	.end
+	ifu dual0
+		ifu norm0
+			dp3 r3.x, r2, r2
+			rsq r3.x, r3.x
+			mul r2.xyz, r2.xyz, r3.xxx
+		.end
+		mov r2.w, ones
+		dp4 r3.x, post[0], r2
+		dp4 r3.y, post[1], r2
+		dp4 r3.z, post[2], r2
+		mov r2.xyz, r3.xyz
+	.end
+	rcp r3.x, r2.z
+	mul r2.xy, r2.xy, r3.xx
+	mov r4, tcs[0]
+	mul outtc0.x, r2.x, r4.x
+	mad outtc0.y, r2.y, r4.y, r4.z
+
+	; unit 1
+	mov r1.xyz, insrc1
+	mov r1.w, ones
+	dp4 r2.x, tm[3], r1
+	dp4 r2.y, tm[4], r1
+	mov r2.z, ones
+	ifu proj1
+		dp4 r2.z, tm[5], r1
+	.end
+	ifu dual1
+		ifu norm1
+			dp3 r3.x, r2, r2
+			rsq r3.x, r3.x
+			mul r2.xyz, r2.xyz, r3.xxx
+		.end
+		mov r2.w, ones
+		dp4 r3.x, post[3], r2
+		dp4 r3.y, post[4], r2
+		dp4 r3.z, post[5], r2
+		mov r2.xyz, r3.xyz
+	.end
+	rcp r3.x, r2.z
+	mul r2.xy, r2.xy, r3.xx
+	mov r4, tcs[1]
+	mul outtc1.x, r2.x, r4.x
+	mad outtc1.y, r2.y, r4.y, r4.z
+
+	; unit 2
+	mov r1.xyz, insrc2
+	mov r1.w, ones
+	dp4 r2.x, tm[6], r1
+	dp4 r2.y, tm[7], r1
+	mov r2.z, ones
+	ifu proj2
+		dp4 r2.z, tm[8], r1
+	.end
+	ifu dual2
+		ifu norm2
+			dp3 r3.x, r2, r2
+			rsq r3.x, r3.x
+			mul r2.xyz, r2.xyz, r3.xxx
+		.end
+		mov r2.w, ones
+		dp4 r3.x, post[6], r2
+		dp4 r3.y, post[7], r2
+		dp4 r3.z, post[8], r2
+		mov r2.xyz, r3.xyz
+	.end
+	rcp r3.x, r2.z
+	mul r2.xy, r2.xy, r3.xx
+	mov r4, tcs[2]
+	mul outtc2.x, r2.x, r4.x
+	mad outtc2.y, r2.y, r4.y, r4.z
+
+	end
+.end

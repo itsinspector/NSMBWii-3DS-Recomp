@@ -6,15 +6,7 @@
 #include "runtime.h"
 #include "gx_state.h"
 
-/* raw (model space) vertex as read by the vertex loader */
-typedef struct {
-    uint32_t pnmtx;
-    uint32_t texmtx[8];
-    float pos[3];
-    float nrm[3][3];       /* normal, binormal, tangent */
-    float col[2][4];
-    float tex[8][2];
-} RawVertex;
+typedef GXRawVertex RawVertex;
 
 static inline float xf(uint32_t addr) { return g_gx.xf_memf[addr & 0xFFF]; }
 static float xfr(uint32_t reg) { return gx_xf_float(g_gx.xf_regs[reg]); }
@@ -319,9 +311,10 @@ static void mul34(uint32_t base, const float *in, float *out)   /* 3x4 matrix ro
 
 static void normalize3(float *v)
 {
-    float l = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    float l = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
     if (l > 0) {
-        v[0] /= l; v[1] /= l; v[2] /= l;
+        float r = 1.0f / sqrtf(l);
+        v[0] *= r; v[1] *= r; v[2] *= r;
     }
 }
 
@@ -335,61 +328,147 @@ static void unpack_rgba(uint32_t c, float *out)
 
 static float clamp01(float x) { return x < 0 ? 0 : x > 1 ? 1 : x; }
 
-/* lighting for one channel component set (rgb or alpha) */
-static void light_channel(uint32_t cntrl, const float *vcol, const float *mat_reg, const float *amb_reg,
-                          const float *pos, const float *nrm, int alpha, float *out)
+/* Lights live in XF memory, which changes without a register write: the
+ * ones a channel uses are unpacked once per draw, not for every vertex. */
+typedef struct {
+    float col[4], pos[3], dir[3], spec[3], a[3], k[3];
+} PLight;
+
+typedef struct {
+    int lit, n, diffuse, attnfn;
+    const float *mat, *amb;    /* NULL: from the vertex color */
+    uint8_t idx[8];
+} ChanComp;
+
+static PLight s_light[8];
+static ChanComp s_comp[2][2];   /* channel, rgb/alpha */
+
+static void prep_lights(void)
 {
-    const float *mat = cntrl & 1 ? vcol : mat_reg;
-    if (!(cntrl & 2)) {
+    uint32_t used = 0;
+    for (int ch = 0; ch < 2; ch++)
+        for (int al = 0; al < 2; al++) {
+            uint32_t cntrl = s_xp.cc[ch][al];
+            ChanComp *c = &s_comp[ch][al];
+            c->mat = cntrl & 1 ? NULL : s_xp.mat[ch];
+            c->amb = cntrl & 0x40 ? NULL : s_xp.amb[ch];
+            c->lit = ch < s_xp.nchan && (cntrl & 2);
+            c->diffuse = (int)BITS(cntrl, 7, 2);
+            c->attnfn = (int)BITS(cntrl, 9, 2);
+            c->n = 0;
+            if (!c->lit)
+                continue;
+            uint32_t mask = BITS(cntrl, 2, 4) | BITS(cntrl, 11, 4) << 4;
+            for (int i = 0; i < 8; i++)
+                if (mask & (1u << i))
+                    c->idx[c->n++] = (uint8_t)i;
+            used |= mask;
+        }
+    for (int i = 0; i < 8; i++) {
+        if (!(used & (1u << i)))
+            continue;
+        uint32_t L = 0x600 + i * 0x10;
+        PLight *l = &s_light[i];
+        unpack_rgba(g_gx.xf_mem[L + 3], l->col);
+        for (int k = 0; k < 3; k++) {
+            l->a[k] = xf(L + 4 + k);
+            l->k[k] = xf(L + 7 + k);
+            l->pos[k] = xf(L + 10 + k);
+            l->dir[k] = xf(L + 13 + k);
+            l->spec[k] = l->pos[k];
+        }
+        normalize3(l->spec);
+    }
+}
+
+/* lighting for one channel component set (rgb or alpha) */
+static void light_channel(const ChanComp *c, const float *vcol, const float *pos, const float *nrm, int alpha, float *out)
+{
+    const float *mat = c->mat ? c->mat : vcol;
+    if (!c->lit) {
         if (alpha) out[3] = mat[3];
         else memcpy(out, mat, 3 * sizeof(float));
         return;
     }
-    const float *amb = cntrl & 0x40 ? vcol : amb_reg;
+    const float *amb = c->amb ? c->amb : vcol;
     float acc[4] = {amb[0], amb[1], amb[2], amb[3]};
-    uint32_t mask = BITS(cntrl, 2, 4) | BITS(cntrl, 11, 4) << 4;
-    uint32_t diffuse = BITS(cntrl, 7, 2), attnfn = BITS(cntrl, 9, 2);
-    for (int i = 0; i < 8; i++) {
-        if (!(mask & (1 << i)))
-            continue;
-        uint32_t L = 0x600 + i * 0x10;
-        float lcol[4], lpos[3] = {xf(L + 10), xf(L + 11), xf(L + 12)};
-        float ldirv[3] = {xf(L + 13), xf(L + 14), xf(L + 15)};
-        unpack_rgba(g_gx.xf_mem[L + 3], lcol);
+    for (int j = 0; j < c->n; j++) {
+        const PLight *l = &s_light[c->idx[j]];
         float ldir[3], attn = 1.0f;
-        if (attnfn == 1) {                         /* specular */
-            ldir[0] = lpos[0]; ldir[1] = lpos[1]; ldir[2] = lpos[2];
-            normalize3(ldir);
+        if (c->attnfn == 1) {                      /* specular */
+            ldir[0] = l->spec[0]; ldir[1] = l->spec[1]; ldir[2] = l->spec[2];
             float nd = nrm[0] * ldir[0] + nrm[1] * ldir[1] + nrm[2] * ldir[2];
-            float h = nd >= 0 ? nrm[0] * ldirv[0] + nrm[1] * ldirv[1] + nrm[2] * ldirv[2] : 0;
+            float h = nd >= 0 ? nrm[0] * l->dir[0] + nrm[1] * l->dir[1] + nrm[2] * l->dir[2] : 0;
             if (h < 0) h = 0;
-            float ca = xf(L + 4) + xf(L + 5) * h + xf(L + 6) * h * h;
-            float da = xf(L + 7) + xf(L + 8) * h + xf(L + 9) * h * h;
+            float ca = l->a[0] + l->a[1] * h + l->a[2] * h * h;
+            float da = l->k[0] + l->k[1] * h + l->k[2] * h * h;
             attn = (ca < 0 ? 0 : ca) / (da != 0 ? da : 1);
-        } else if (attnfn == 3) {                  /* spotlight with distance attenuation */
-            ldir[0] = lpos[0] - pos[0]; ldir[1] = lpos[1] - pos[1]; ldir[2] = lpos[2] - pos[2];
+        } else if (c->attnfn == 3) {               /* spotlight with distance attenuation */
+            ldir[0] = l->pos[0] - pos[0]; ldir[1] = l->pos[1] - pos[1]; ldir[2] = l->pos[2] - pos[2];
             float d2 = ldir[0] * ldir[0] + ldir[1] * ldir[1] + ldir[2] * ldir[2], d = sqrtf(d2);
-            if (d > 0) { ldir[0] /= d; ldir[1] /= d; ldir[2] /= d; }
-            float c = ldir[0] * ldirv[0] + ldir[1] * ldirv[1] + ldir[2] * ldirv[2];
-            if (c < 0) c = 0;
-            float ca = xf(L + 4) + xf(L + 5) * c + xf(L + 6) * c * c;
-            float da = xf(L + 7) + xf(L + 8) * d + xf(L + 9) * d2;
+            if (d > 0) { float r = 1.0f / d; ldir[0] *= r; ldir[1] *= r; ldir[2] *= r; }
+            float cs = ldir[0] * l->dir[0] + ldir[1] * l->dir[1] + ldir[2] * l->dir[2];
+            if (cs < 0) cs = 0;
+            float ca = l->a[0] + l->a[1] * cs + l->a[2] * cs * cs;
+            float da = l->k[0] + l->k[1] * d + l->k[2] * d2;
             attn = (ca < 0 ? 0 : ca) / (da != 0 ? da : 1);
         } else {                                   /* none / directional */
-            ldir[0] = lpos[0] - pos[0]; ldir[1] = lpos[1] - pos[1]; ldir[2] = lpos[2] - pos[2];
+            ldir[0] = l->pos[0] - pos[0]; ldir[1] = l->pos[1] - pos[1]; ldir[2] = l->pos[2] - pos[2];
             normalize3(ldir);
         }
         float k = attn;
-        if (diffuse) {
+        if (c->diffuse) {
             float nd = nrm[0] * ldir[0] + nrm[1] * ldir[1] + nrm[2] * ldir[2];
-            if (diffuse == 2 && nd < 0) nd = 0;
+            if (c->diffuse == 2 && nd < 0) nd = 0;
             k *= nd;
         }
-        for (int c = 0; c < 4; c++)
-            acc[c] += k * lcol[c];
+        acc[0] += k * l->col[0];
+        acc[1] += k * l->col[1];
+        acc[2] += k * l->col[2];
+        acc[3] += k * l->col[3];
     }
     if (alpha) out[3] = mat[3] * clamp01(acc[3]);
-    else for (int c = 0; c < 3; c++) out[c] = mat[c] * clamp01(acc[c]);
+    else for (int i = 0; i < 3; i++) out[i] = mat[i] * clamp01(acc[i]);
+}
+
+/* regular texgen: a texture matrix times a position, normal, color or
+ * texture coordinate source, then the dual texgen post matrix */
+static void texgen_regular(const RawVertex *in, int i, uint32_t info, float *o)
+{
+    uint32_t proj = BITS(info, 1, 1), form = BITS(info, 2, 1), row = BITS(info, 7, 5);
+    float src[4] = {0, 0, 1, 1};
+    switch (row) {
+    case 0: memcpy(src, in->pos, 3 * sizeof(float)); break;
+    case 1: memcpy(src, in->nrm[0], 3 * sizeof(float)); break;
+    case 2: src[0] = in->col[0][0]; src[1] = in->col[0][1]; src[2] = in->col[0][2]; break;
+    case 3: memcpy(src, in->nrm[1], 3 * sizeof(float)); break;
+    case 4: memcpy(src, in->nrm[2], 3 * sizeof(float)); break;
+    default:
+        if (row >= 5 && row <= 12) {
+            src[0] = in->tex[row - 5][0];
+            src[1] = in->tex[row - 5][1];
+        }
+    }
+    if (!form)
+        src[2] = 1.0f;
+    uint32_t m = in->texmtx[i] * 4;
+    float r[3];
+    r[0] = xf(m) * src[0] + xf(m + 1) * src[1] + xf(m + 2) * src[2] + xf(m + 3) * src[3];
+    r[1] = xf(m + 4) * src[0] + xf(m + 5) * src[1] + xf(m + 6) * src[2] + xf(m + 7) * src[3];
+    r[2] = proj ? xf(m + 8) * src[0] + xf(m + 9) * src[1] + xf(m + 10) * src[2] + xf(m + 11) * src[3] : 1.0f;
+    if (s_xp.dual) {
+        uint32_t post = s_xp.post[i];
+        if (BITS(post, 8, 1))
+            normalize3(r);
+        float s4[4] = {r[0], r[1], r[2], 1.0f};
+        mul34(0x500 + BITS(post, 0, 6) * 4, s4, r);
+    }
+    o[0] = r[0]; o[1] = r[1]; o[2] = r[2];
+}
+
+void gx_texgen(const GXRawVertex *in, int i, float out[3])
+{
+    texgen_regular(in, i, s_xp.gen[i], out);
 }
 
 int g_gx_debug_vertex;
@@ -429,8 +508,8 @@ static void transform(const RawVertex *in, GXVertex *out)
             o[0] = o[1] = o[2] = o[3] = 0;
             continue;
         }
-        light_channel(s_xp.cc[ch][0], in->col[ch], s_xp.mat[ch], s_xp.amb[ch], view, n, 0, o);
-        light_channel(s_xp.cc[ch][1], in->col[ch], s_xp.mat[ch], s_xp.amb[ch], view, n, 1, o);
+        light_channel(&s_comp[ch][0], in->col[ch], view, n, 0, o);
+        light_channel(&s_comp[ch][1], in->col[ch], view, n, 1, o);
     }
 
     /* texture coordinate generation */
@@ -443,7 +522,7 @@ static void transform(const RawVertex *in, GXVertex *out)
     for (int i = 0; i < ngen; i++) {
         float *o = out->tex[i];
         uint32_t info = s_xp.gen[i];
-        uint32_t proj = BITS(info, 1, 1), form = BITS(info, 2, 1), type = BITS(info, 4, 3), row = BITS(info, 7, 5);
+        uint32_t type = BITS(info, 4, 3);
         if (type == 2 || type == 3) {              /* color texgen */
             o[0] = out->color[type - 2][0];
             o[1] = out->color[type - 2][1];
@@ -459,40 +538,14 @@ static void transform(const RawVertex *in, GXVertex *out)
             }
             continue;
         }
-        float src[4] = {0, 0, 1, 1};
-        switch (row) {
-        case 0: memcpy(src, in->pos, 3 * sizeof(float)); break;
-        case 1: memcpy(src, in->nrm[0], 3 * sizeof(float)); break;
-        case 2: src[0] = in->col[0][0]; src[1] = in->col[0][1]; src[2] = in->col[0][2]; break;
-        case 3: memcpy(src, in->nrm[1], 3 * sizeof(float)); break;
-        case 4: memcpy(src, in->nrm[2], 3 * sizeof(float)); break;
-        default:
-            if (row >= 5 && row <= 12) {
-                src[0] = in->tex[row - 5][0];
-                src[1] = in->tex[row - 5][1];
-            }
-        }
-        if (!form)
-            src[2] = 1.0f;
-        uint32_t m = in->texmtx[i] * 4;
-        float r[3];
-        r[0] = xf(m) * src[0] + xf(m + 1) * src[1] + xf(m + 2) * src[2] + xf(m + 3) * src[3];
-        r[1] = xf(m + 4) * src[0] + xf(m + 5) * src[1] + xf(m + 6) * src[2] + xf(m + 7) * src[3];
-        r[2] = proj ? xf(m + 8) * src[0] + xf(m + 9) * src[1] + xf(m + 10) * src[2] + xf(m + 11) * src[3] : 1.0f;
-        if (s_xp.dual) {
-            uint32_t post = s_xp.post[i];
-            if (BITS(post, 8, 1))
-                normalize3(r);
-            float s4[4] = {r[0], r[1], r[2], 1.0f};
-            mul34(0x500 + BITS(post, 0, 6) * 4, s4, r);
-        }
-        o[0] = r[0]; o[1] = r[1]; o[2] = r[2];
+        texgen_regular(in, i, info, o);
     }
 }
 
 /* -------------------------------------------------------------- assembly */
 
 static GXVertex *s_verts, *s_tris;
+static RawVertex *s_raw;
 static uint32_t s_cap, s_tri_cap;
 static uint32_t *s_idx;
 static uint32_t s_idx_cap;
@@ -514,17 +567,6 @@ void gx_draw_primitive(uint8_t op, const uint8_t *data, uint32_t count)
     int vat = op & 7, prim = (op >> 3) & 7;    /* 0 quads,2 tris,3 strip,4 fan,5 lines,6 strip,7 points */
     if (!count)
         return;
-    if (count > s_cap) {
-        s_cap = count + 256;
-        s_verts = realloc(s_verts, s_cap * sizeof *s_verts);
-    }
-    PROF_BEGIN(tl);
-    const VtxPlan *pl = draw_setup(vat);
-    for (uint32_t i = 0; i < count; i++) {
-        RawVertex raw;
-        data = load_vertex(pl, data, &raw);
-        transform(&raw, &s_verts[i]);
-    }
     uint32_t ntri;
     switch (prim) {
     case 0: case 1: ntri = count / 4 * 2; break;
@@ -532,6 +574,15 @@ void gx_draw_primitive(uint8_t op, const uint8_t *data, uint32_t count)
     case 3: case 4: ntri = count >= 3 ? count - 2 : 0; break;
     default: return;                               /* lines and points: not drawn yet */
     }
+    if (count > s_cap) {
+        s_cap = count + 256;
+        s_verts = realloc(s_verts, s_cap * sizeof *s_verts);
+        s_raw = realloc(s_raw, s_cap * sizeof *s_raw);
+    }
+    PROF_BEGIN(tl);
+    const VtxPlan *pl = draw_setup(vat);
+    for (uint32_t i = 0; i < count; i++)
+        data = load_vertex(pl, data, &s_raw[i]);
     if (ntri * 3 > s_idx_cap) {
         s_idx_cap = ntri * 3 + 256;
         s_idx = realloc(s_idx, s_idx_cap * sizeof *s_idx);
@@ -562,7 +613,24 @@ void gx_draw_primitive(uint8_t op, const uint8_t *data, uint32_t count)
         break;
     }
     PROF_END(tl, PROF_TL);
+    uint32_t nidx = (uint32_t)(o - s_idx);
+#ifdef __3DS__
+    {
+        PROF_BEGIN(sub);
+        int done = gfx_draw_raw(s_raw, count, s_idx, nidx, pl->texmtx_direct != 0);
+        PROF_END(sub, PROF_SUBMIT);
+        if (done)
+            return;
+    }
+#endif
+    {
+        PROF_BEGIN(tl);
+        prep_lights();
+        for (uint32_t i = 0; i < count; i++)
+            transform(&s_raw[i], &s_verts[i]);
+        PROF_END(tl, PROF_TL);
+    }
     PROF_BEGIN(sub);
-    gfx_draw_indexed(s_verts, count, s_idx, (uint32_t)(o - s_idx));
+    gfx_draw_indexed(s_verts, count, s_idx, nidx);
     PROF_END(sub, PROF_SUBMIT);
 }

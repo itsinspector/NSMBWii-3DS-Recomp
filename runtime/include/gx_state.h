@@ -90,6 +90,19 @@ typedef struct {
 void gx_draw_primitive(uint8_t op, const uint8_t *data, uint32_t count);
 uint32_t gx_vertex_size(int vat);
 
+/* model space vertex as read by the vertex loader */
+typedef struct {
+    uint32_t pnmtx;
+    uint32_t texmtx[8];
+    float pos[3];
+    float nrm[3][3];       /* normal, binormal, tangent */
+    float col[2][4];
+    float tex[8][2];
+} GXRawVertex;
+/* texture coordinate generation i on the CPU (regular texgens: matrix of a
+ * position, normal or texture coordinate source) */
+void gx_texgen(const GXRawVertex *in, int i, float out[3]);
+
 /* --- gx_texture.c */
 const GXTexture *gx_get_texture(int unit);
 void gx_texture_invalidate(void);
@@ -103,6 +116,11 @@ void gfx_draw_indexed(const GXVertex *v, uint32_t nverts, const uint32_t *idx, u
 void gx_expand_indexed(const GXVertex *v, const uint32_t *idx, uint32_t nidx,
                        void (*draw)(const GXVertex *, uint32_t));
 void gfx_draw_triangles(const GXVertex *v, uint32_t count);   /* count vertices, 3 per triangle */
+#ifdef __3DS__
+/* model space vertices, transformed by the GPU; 0: the draw needs the CPU
+ * transform (lighting, color texgens, per-vertex texture matrices) */
+int gfx_draw_raw(const GXRawVertex *v, uint32_t nverts, const uint32_t *idx, uint32_t nidx, int texmtx_direct);
+#endif
 void gfx_efb_copy(uint32_t trigger);                         /* BP 0x52 */
 void gfx_present(void);
 void gfx_texture_will_change(void);  /* a decoded texture is about to be replaced */
