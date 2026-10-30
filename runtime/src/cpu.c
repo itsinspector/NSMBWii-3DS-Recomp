@@ -4,7 +4,27 @@
 #include <string.h>
 #include "runtime.h"
 
+/* indirect calls (virtual functions, function pointers) hit a small
+ * direct-mapped cache before the binary search over ~39,000 functions */
+#define CALL_CACHE 4096
+static struct { uint32_t addr; ppc_func_t fn; } s_call_cache[CALL_CACHE];
+
+static ppc_func_t search_function(uint32_t addr);
+
 ppc_func_t lookup_function(uint32_t addr)
+{
+    uint32_t h = (addr >> 2) & (CALL_CACHE - 1);
+    if (s_call_cache[h].addr == addr && s_call_cache[h].fn)
+        return s_call_cache[h].fn;
+    ppc_func_t fn = search_function(addr);
+    if (fn) {
+        s_call_cache[h].addr = addr;
+        s_call_cache[h].fn = fn;
+    }
+    return fn;
+}
+
+static ppc_func_t search_function(uint32_t addr)
 {
     uint32_t lo = 0, hi = g_ppc_func_count;
     while (lo < hi) {

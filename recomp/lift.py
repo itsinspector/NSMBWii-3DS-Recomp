@@ -311,7 +311,10 @@ class FunctionLifter:
 
     # ---- loads / stores (D-form)
     def acc(self, fn, i=None):
-        """Accessor name for a memory op: static MMIO, checked, or plain."""
+        """Accessor name for a memory op: static MMIO, checked, or plain.
+        Stack (r1) and small-data (r2, r13) bases never point at hardware."""
+        if i is not None and i.rA in (1, 2, 13):
+            return fn
         if i is not None and self.mmio_base(i):
             return "mmio_" + fn
         if self.hw_func:
@@ -374,9 +377,20 @@ class FunctionLifter:
 
     # ---- paired-single quantized load/store
     def _psq(self, store, ea, w, gqr, frn, update_ra=None):
-        fn = "ppc_psq_st" if store else "ppc_psq_l"
+        """Inline fast path for float (unquantized) GQR types 0-3, which the
+        SDK's matrix and vector code uses; the runtime handles the rest."""
         upd = f" c->r[{update_ra}] = ea;" if update_ra is not None else ""
-        self.emit(f"{{ uint32_t ea = {ea}; {fn}(c, ea, {w}, {gqr}, {frn});{upd} }}")
+        if store:
+            # checked: GX matrix uploads psq_st into the write-gather pipe
+            second = "" if w else f" chk_stf32(ea + 4, {P1(frn)});"
+            fast = f"chk_stf32(ea, {F(frn)});{second}"
+            cond = f"!(c->gqr[{gqr}] & 4u)"
+            slow = f"ppc_psq_st(c, ea, {w}, {gqr}, {frn});"
+        else:
+            fast = f"{F(frn)} = ldf32(ea); {P1(frn)} = {'1.0' if w else 'ldf32(ea + 4)'};"
+            cond = f"!(c->gqr[{gqr}] & 0x40000u)"
+            slow = f"ppc_psq_l(c, ea, {w}, {gqr}, {frn});"
+        self.emit(f"{{ uint32_t ea = {ea}; if ({cond}) {{ {fast} }} else {slow}{upd} }}")
 
     def op56(self, i):
         self._psq(False, f"({RA0(i.rA)} + {i.ps_d})", i.ps_w, i.ps_i, i.rD)
