@@ -1,150 +1,160 @@
+<div align="center">
+
 # NSMBWii-3DS-Recomp
 
-An experimental port of *New Super Mario Bros. Wii* (SMNE01, USA rev 2) to the
-**New Nintendo 3DS**, made by statically recompiling the game's PowerPC code to C
-and compiling that for the 3DS's ARM11. The same runtime also builds for Windows
-(MSVC), with an OpenGL renderer.
+**New Super Mario Bros. Wii, running natively on the New Nintendo 3DS and on Windows**
 
-> **No game data included.** This repository contains no Nintendo code or assets.
-> Everything derived from the game (`game/`, `build/gen/`, `rel_image.bin`,
-> `pcdata/`, the built `.cia`/`.cxi` files) is generated locally from your own
-> copy of the disc and must not be redistributed.
+*A static recompilation: the game's PowerPC code is translated to C ahead of time
+and compiled for the 3DS's ARM11, no emulator involved.*
 
-**Building:** see the step-by-step guide in [docs/BUILDING.md](docs/BUILDING.md).
+![New 3DS](https://img.shields.io/badge/New%203DS-in%20progress-orange)
+![Windows](https://img.shields.io/badge/Windows-playable-brightgreen)
+![Status](https://img.shields.io/badge/status-experimental-yellow)
 
-## Status
+</div>
 
-| | PC (Windows) | New 3DS |
+> [!IMPORTANT]
+> **No game included.** This repository holds only the recompiler and the runtime.
+> You need your own copy of the disc. Everything built from it (extracted files,
+> generated code, `rel_image.bin`, `.cia`/`.cxi` files) stays on your computer and
+> **must not be shared**.
+
+---
+
+## What works
+
+| | 🖥️ Windows | 🎮 New 3DS |
 |---|---|---|
-| Boot, menus, title screen | ✅ 60 fps | ✅ runs, slow |
-| Intro cutscene | ✅ 30–60 fps | ⚠️ runs, very slow |
-| World map / levels | ⚠️ playable, a freeze is reported in World 1-3 | ⚠️ not verified |
-| Audio | ✅ | ⚠️ needs `dspfirm.cdc`, not verified |
-| Old 3DS | — | ❌ not enough memory (needs ~122 MB, the Old 3DS gives 96 MB) |
+| Menus, title screen, file select | ✅ 60 fps | ✅ |
+| World map and levels | ✅ 60 fps | ⚠️ runs, slow |
+| Graphics (lighting, water, animated blocks) | ✅ | ✅ mostly |
+| Audio | ✅ | ⚠️ needs `dspfirm.cdc`, untested |
+| Save data | ✅ | ✅ |
+| Old 3DS / 2DS | — | ❌ not enough memory |
 
-On the 3DS the recompiled game code is the main bottleneck: it is far slower on the
-ARM11 than on the Wii's CPU. When the host cannot keep up, an adaptive *guest clock*
-slows the game's own sense of time (VI, timers, audio) so that its timer-driven
-threads cannot starve the main thread. The game then runs in slow motion instead of
-freezing. In Azahar, set the CPU clock to 300%: a real New 3DS runs at 804 MHz, but
-Azahar emulates 268 MHz at 100%.
+**How fast is the 3DS build?** Measured in the Azahar emulator: about 6–14 fps in
+menus and light scenes and 1–3 fps in the heaviest ones. A real New 3DS should do
+better than Azahar, but it is still far from full speed. The work so far, and what
+comes next, is in the [performance report](docs/3DS_PERFORMANCE_REPORT.md).
 
-- [x] Full recompilation (~39k functions), symbols (~2.2k names)
-- [x] HLE of the OS, IOS (disc, NAND, ES, STM), Wii Remote, `OSLink`
-- [x] GX: OpenGL renderer and software reference renderer on PC; EFB copies with
-      format conversion, EGG light textures
-- [x] Audio: DSP/AX in HLE (ADPCM/PCM voices, resampling, envelopes, filters, mixer)
-- [x] citro3d backend for 3DS; `.cxi`/`.cia` with the New 3DS extended memory mode;
-      "full" CIA with the game data in the RomFS
-- [ ] 3DS performance: native replacements for hot functions, guest registers in
-      host locals, second CPU core, vertex transforms on the PICA200
-- [ ] SYSCONF / setting.txt in the NAND
+## Get started
 
-## Quick start
+You need:
+- your own *New Super Mario Bros. Wii* disc image, **USA rev 2 (SMNE01)**, unencrypted;
+- **Python 3.10+** and, depending on the target, **Visual Studio** (PC) or
+  **devkitPro** (3DS).
+
+Then it is four steps:
 
 ```bash
-python tools/extract_disc.py nsmbwii.iso game
-python -m recomp game build/gen
-python tools/build_pc.py      # PC (MSVC); --trace for the function ring buffer
-make cia                      # 3DS, from the devkitPro MSYS2 shell (game data on the SD)
-make cia-full                 # 3DS, game data inside the CIA
+python tools/extract_disc.py nsmbwii.iso game     # 1. extract the disc
+python -m recomp game build/gen                   # 2. recompile the game code
+python tools/build_pc.py                          # 3a. build for Windows
+make cia-full                                     # 3b. or for the 3DS (devkitPro shell)
 ```
 
-A plain `.3dsx` is not enough: it only gets 64 MB, less than the Wii's RAM.
-`makerom` goes in `tools/bin/` (releases of github.com/3DSGuy/Project_CTR).
+👉 **Step-by-step guide, with every tool and where each file goes:
+[docs/BUILDING.md](docs/BUILDING.md)**
 
-Runtime data (`sdmc:/3ds/nsmbw/` on 3DS, `pcdata/` or `$NSMBW_DATA` on PC):
-- `game.iso`: the unencrypted disc image (the disc is read straight from it)
-- `rel_image.bin`: generated by the recompiler
+## Where the files go
 
-Save data (the emulated Wii NAND, created on first run; saves from the old
-`nand/` folder are copied over once):
-- PC: `%LOCALAPPDATA%\NSMBWii\` (or `$NSMBW_SAVE`)
-- 3DS: `sdmc:/3ds/nsmbw/save/`
+**Windows**: next to the project, in `pcdata/`:
 
-PC controls (game window or console focused), Wii Remote held sideways: arrows =
-D-pad, `Z` = jump (2), `X` = run (1), `C` = shake, `Enter` = +, `Backspace` = −,
-`A` / `B` = A / B.
+```
+pcdata/
+├── game.iso          your disc image
+└── rel_image.bin     from build/gen/
+```
 
-## Environment variables (PC)
+Save data is kept in `%LOCALAPPDATA%\NSMBWii\`.
 
-Performance and rendering:
+**3DS**: with `nsmbw3ds_full.cia` the game data is already inside, nothing else to
+copy. With the plain `nsmbw3ds.cia`, put this on the SD card:
 
-| Variable | Effect |
+```
+SD:/3ds/
+├── dspfirm.cdc       for audio (dump it from your console with DSP1)
+└── nsmbw/
+    ├── game.iso      your disc image (FAT32: must be under 4 GB)
+    └── rel_image.bin from build/gen/
+```
+
+Save data goes to `SD:/3ds/nsmbw/save/`, the log to `SD:/3ds/nsmbw/log.txt`.
+
+## Controls
+
+The Wii Remote is held sideways, as the game expects.
+
+| Wii Remote | 🖥️ Keyboard | 🎮 3DS |
+|---|---|---|
+| D-pad | arrow keys | D-pad / Circle Pad |
+| 2 (jump) | `Z` | A / B |
+| 1 (run, fireball) | `X` | Y |
+| Shake (spin, pick up) | `C` | X / L / R |
+| + (pause) | `Enter` | START |
+| − | `Backspace` | SELECT |
+| A / B (menus) | `A` / `B` | — |
+| Quit | close the window | START + SELECT |
+
+## FAQ
+
+<details>
+<summary><b>Does it work on an Old 3DS or 2DS?</b></summary>
+
+No. The game needs about 125 MB (the Wii's 88 MB of RAM plus the recompiled code),
+and an Old 3DS gives an application at most 96 MB. Its CPU is also three times slower
+than the New 3DS's.
+</details>
+
+<details>
+<summary><b>Why not a <code>.3dsx</code> for the Homebrew Launcher?</b></summary>
+
+A `.3dsx` only gets 64 MB. The `.cia`/`.cxi` ask for the New 3DS's extended memory
+mode (178 MB), which the game needs.
+</details>
+
+<details>
+<summary><b>Which version of the game?</b></summary>
+
+Only **USA rev 2 (SMNE01)**. The recompiler targets this exact executable; other
+regions or revisions have different code.
+</details>
+
+<details>
+<summary><b>The game crashed or froze. What should I send?</b></summary>
+
+On 3DS: `SD:/3ds/nsmbw/log.txt`, plus `crash.txt` / `hang.txt` from the same folder
+if they exist, or the Luma3DS dump from `SD:/luma/dumps/arm11/`. On Windows:
+`pcdata/log.txt`. Say which build you used: crash addresses are only readable with
+the matching `.elf`.
+</details>
+
+<details>
+<summary><b>Is this an emulator?</b></summary>
+
+No. An emulator reads the game's PowerPC instructions while it runs. Here every game
+function was translated to C beforehand and compiled to native code. The runtime
+replaces the Wii's operating system and hardware: graphics (GX → OpenGL or the 3DS
+GPU), audio, disc, saves, Wii Remote. Technical details are in
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+</details>
+
+## Documentation
+
+| | |
 |---|---|
-| `NSMBW_RENDERER=soft` | software renderer instead of OpenGL |
-| `NSMBW_RES_SCALE=1..4` | OpenGL internal resolution (default 2) |
-| `NSMBW_GX_THREAD=0` | run the GX command processor on the game thread |
-| `NSMBW_NOAUDIO=1`, `NSMBW_NOWINDOW=1` | no audio / hidden window |
-| `NSMBW_PROFILE=<sec>` | sampling profiler in the log; `NSMBW_PROFILE_THREAD=<n>` for one thread |
-| `NSMBW_RENDER_THREADS=<n>` | software renderer threads |
-
-Debugging:
-
-| Variable | Effect |
-|---|---|
-| `NSMBW_DUMP_FRAMES=<N>` | PNG every N frames in `pcdata/frames/` (`tools/crop.py` to zoom) |
-| `NSMBW_FAST=1` | software renderer: rasterize only near dumped frames |
-| `NSMBW_WATCHDOG=<sec>` | guest thread stacks, for `tools/stacks.py` |
-| `NSMBW_INPUT="vsync:mask,..."` | scripted input (16 = button 2, 512 = A) |
-| `NSMBW_MAX_FRAMES=<N>` | quit after N frames |
-| `NSMBW_GL_DEBUG=<bits>` | OpenGL: 1 no depth, 2 no EFB-copy textures, 4 no blend, 8 no alpha test, 16 log copies, 128 no culling |
-| `NSMBW_FTZ=1`, `NSMBW_SLOW_US=<us>` | emulate the 3DS's flush-to-zero / a slow host |
-| `NSMBW_DEBUG_GX`, `NSMBW_DEBUG_DI`, `NSMBW_DEBUG_DSP`, `NSMBW_DEBUG_COPY`, `NSMBW_DUMP_MATS`, `NSMBW_TRACE_DEPTH` | subsystem logs |
-
-When the game stops sending GX commands for 5 seconds, the log gets a dump of every
-guest thread with its call chain (PC and 3DS).
-
-## Layout
-
-| Path | Contents |
-|---|---|
-| `tools/extract_disc.py` | extracts the filesystem of an **unencrypted** Wii disc image |
-| `tools/build_pc.py` | incremental MSVC build of the PC executable |
-| `recomp/binfmt.py` | DOL / REL parser, REL relocations, LZ11 decompressor |
-| `recomp/analyze.py` | DOL + 4 RELs in one address space; function and jump table discovery |
-| `recomp/lift.py` | PowerPC (Gekko/Broadway, paired singles included) → C lifter |
-| `recomp/symbols.py` | community symbol maps (PAL v1) converted to USA rev 2 |
-| `recomp/sigdb.py` | SDK function recognition with Dolphin's signature database |
-| `config/symbols.txt` | functions identified by hand (with the evidence) |
-| `config/hle.txt` | guest functions replaced by native code |
-| `config/nsmbw3ds*.rsf` | makerom settings (New 3DS memory mode; RomFS for the full CIA) |
-| `runtime/src/hle_os.c` | threads, contexts, interrupts, decrementer, adaptive guest clock |
-| `runtime/src/hle_ios.c` | IOS: `/dev/di` (from the ISO), `/dev/fs` + NAND, ES, STM |
-| `runtime/src/hle_input.c` | Wii Remote (KPAD/WPAD) from host input |
-| `runtime/src/hle_rel.c` | `OSLink` onto the pre-relocated RELs |
-| `runtime/src/hw.c` | hardware registers: PI, VI, PE/CP, AI, EXI, GX FIFO (and its thread on PC), locked-cache DMA |
-| `runtime/src/gx.c` | GX command processor: CP/XF/BP registers, display lists, TLUT, EFB copies |
-| `runtime/src/gx_vertex.c` | vertex loader, transforms, lighting, texgen (on the CPU) |
-| `runtime/src/gx_texture.c` | GX texture decoding (all formats) with a cache |
-| `runtime/src/dsp.c` | DSP at mailbox level (boot ROM, AX protocol) and AI DMA |
-| `runtime/src/ax_hle.c` | AX microcode in HLE |
-| `runtime/src/gfx_gl.c` | OpenGL 3.3 backend (PC, default): render thread, TEV → GLSL |
-| `runtime/src/gfx_soft.c` | reference software renderer (PC): full TEV, frame PNGs |
-| `runtime/src/gfx_c3d.c` | 3DS citro3d backend: EFB as a render target, TEV → 6 PICA combiners |
-| `runtime/src/platform_*.c` | 3DS (libctru) and PC (Win32, with a watchdog and profiler) |
-| `third_party/` | community symbol maps and Dolphin's `totaldb.dsy` |
-
-## How it runs
-
-- Every guest function becomes `void f_XXXXXXXX(PPCContext *c)`.
-- Guest memory (MEM1 24 MiB + MEM2 64 MiB) is big-endian, mapped in 64 KiB pages.
-- The RELs are relocated from `0x93400000`; `bl`s into the DOL take their target
-  from the relocations.
-- **Threads**: the game's own scheduler stays recompiled; each guest context lives
-  on a host thread, and `OSSaveContext` is a `setjmp` in the caller's frame.
-- **Interrupts** are delivered at safe points by calling the game's real handlers.
-- **Graphics**: the GX FIFO is interpreted and vertices are transformed on the CPU
-  (state derived from the CP/XF registers is recomputed only when they change). The
-  backend then draws: OpenGL or software on PC, citro3d on 3DS. On PC the command
-  processor runs on its own thread, like the real GPU.
-- **Audio**: the DSP is not executed; AX command lists are interpreted in C
-  (3 ms frames at 32 kHz) and the AI buffer goes to host audio (waveOut / ndsp).
+| [docs/BUILDING.md](docs/BUILDING.md) | building for Windows and 3DS, step by step |
+| [docs/3DS_PERFORMANCE_REPORT.md](docs/3DS_PERFORMANCE_REPORT.md) | where the 3DS time goes, what was optimized, what is next |
+| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | how the recompiler and runtime work, project layout, debug options |
 
 ## Credits
 
-- [NSMBW-Decomp](https://github.com/NSMBW-Community/NSMBW-Decomp) and the Newer team
+- [NSMBW-Decomp](https://github.com/NSMBW-Community/NSMBW-Decomp) and the Newer team,
   for the symbol maps used to name functions.
-- [Dolphin](https://dolphin-emu.org/) for `totaldb.dsy` (GPL) and for its documentation
-  of the hardware.
-- devkitPro, libctru and citro3d for the 3DS toolchain; Project_CTR for makerom.
+- [Dolphin](https://dolphin-emu.org/), for `totaldb.dsy` (GPL) and its documentation
+  of the Wii hardware.
+- [devkitPro](https://devkitpro.org/), libctru and citro3d for the 3DS toolchain;
+  [Project_CTR](https://github.com/3DSGuy/Project_CTR) for makerom.
+
+*New Super Mario Bros. Wii is a trademark of Nintendo. This project is not affiliated
+with or endorsed by Nintendo.*
