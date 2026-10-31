@@ -14,6 +14,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <malloc.h>
 #include "runtime.h"
 #include "gx_state.h"
 #include "vshader_shbin.h"
@@ -166,6 +167,7 @@ static void free_retired(int all)
     s_ngretired = keep;
 }
 static uint32_t s_gtex_bytes;
+extern u32 __ctru_heap_size;
 #define GPU_TEX_BUDGET (14u << 20)   /* linear memory: ~29 MiB free, 4.8 MiB vertex buffer */
 
 static int pow2(int v)
@@ -1901,8 +1903,11 @@ void gfx_present(void)
         rt_log("[tl] %lu vertices per frame, %lu with an indirect lookup", (unsigned long)(s_tl_verts[0] / 120),
                (unsigned long)(s_tl_verts[1] / 120));
         memset(s_tl_verts, 0, sizeof s_tl_verts);
-        rt_log("[mem] GPU %.1f ms drawing per frame, linear free %lu KiB, VRAM free %lu KiB, GPU textures %lu KiB",
-               C3D_GetDrawingTime(), (unsigned long)(linearSpaceFree() >> 10), (unsigned long)(vramSpaceFree() >> 10),
+        struct mallinfo mi = mallinfo();
+        rt_log("[mem] GPU %.1f ms drawing per frame, heap %lu/%lu KiB used, linear free %lu KiB, VRAM free %lu KiB, "
+               "GPU textures %lu KiB",
+               C3D_GetDrawingTime(), (unsigned long)(mi.uordblks >> 10), (unsigned long)(__ctru_heap_size >> 10),
+               (unsigned long)(linearSpaceFree() >> 10), (unsigned long)(vramSpaceFree() >> 10),
                (unsigned long)(s_gtex_bytes >> 10));
         memset(s_tl_count, 0, sizeof s_tl_count);
     }

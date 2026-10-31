@@ -1,6 +1,10 @@
 /* Guest physical memory (MEM1 24 MiB + MEM2 64 MiB) and the address map. */
 #include <stdlib.h>
+#include <string.h>
 #include "runtime.h"
+#ifdef __3DS__
+#include <3ds.h>
+#endif
 
 uint8_t *g_memmap[65536];
 uint8_t *g_mem1, *g_mem2;
@@ -20,7 +24,15 @@ int mem_init(void)
 {
     /* +16 so an 8-byte access at the last bytes of a region stays in bounds */
     g_mem1 = calloc(1, MEM1_SIZE + 16);
+#ifdef __3DS__
+    /* the normal heap can be at most 96 MiB (0x08000000-0x0E000000): MEM2
+     * lives in linear memory, which gets the rest (__ctru_heap_size) */
+    g_mem2 = linearAlloc(MEM2_SIZE + 16);
+    if (g_mem2)
+        memset(g_mem2, 0, MEM2_SIZE + 16);
+#else
     g_mem2 = calloc(1, MEM2_SIZE + 16);
+#endif
     s_scratch = calloc(1, 0x10000 + 16);
     s_locked_cache = calloc(1, 0x10000 + 16);
     if (!g_mem1 || !g_mem2 || !s_scratch || !s_locked_cache) {

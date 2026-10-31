@@ -161,7 +161,7 @@ static uint32_t hash(const uint8_t *p, uint32_t n)
 #define SETS 1024
 #define WAYS 8
 #ifdef __3DS__
-#define BUDGET (8u << 20)       /* the heap also holds 88 MiB of guest RAM */
+#define BUDGET (8u << 20)       /* the 50 MiB heap also holds MEM1 (24 MiB) */
 #else
 #define BUDGET (512u << 20)
 #endif

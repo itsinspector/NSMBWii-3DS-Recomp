@@ -11,6 +11,14 @@
 /* Recompiled code nests host calls as deep as the guest call stack. */
 u32 __stacksize__ = 1024 * 1024;
 
+/* libctru splits free memory between the normal heap and linear memory. By
+ * default the normal heap gets all but 32 MiB, ~110 MiB in New 3DS mode, but
+ * its address range holds 96 MiB: on hardware the allocation fails and
+ * libctru stops before main (svcBreak). The normal heap holds MEM1, decoded
+ * textures, the GX ring and thread stacks; linear memory gets the rest
+ * (~89 MiB: MEM2 and the GPU's buffers and textures). */
+u32 __ctru_heap_size = 50 * 1024 * 1024;
+
 struct plat_sem { LightSemaphore s; };
 
 plat_sem *plat_sem_create(void)
