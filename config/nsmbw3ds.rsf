@@ -51,6 +51,10 @@ AccessControlInfo:
   RunnableOnSleep               : false
   SpecialMemoryArrange          : true
   CanAccessCore2                : true
+  IORegisterMapping:
+    - 1ff00000-1ff7ffff   # DSP memory (ndsp audio)
+  MemoryMapping:
+    - 1f000000-1f5fffff:r # VRAM
   SystemCallAccess:
     ControlMemory: 1
     QueryMemory: 2
